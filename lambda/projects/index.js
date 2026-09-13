@@ -25,6 +25,7 @@ import {
   isEnvironmentResolutionError,
   resolvePublishedEnvironment,
 } from '../shared/environment-snapshot.js';
+import { validateStageEnvironments } from '../shared/stage-environments.js';
 import { requirePlatformAdmin } from '../shared/authz.js';
 import { runTrackerMigration } from '../shared/tracker-migration.js';
 import { getGitConnection } from '../shared/git-connection-store.js';
@@ -183,7 +184,23 @@ const readV2Settings = (v) => {
       DEFAULT_PR_STRATEGY,
     stageSkipping: getVal(v, 'stage_skipping') || DEFAULT_STAGE_SKIPPING,
     environmentId: getVal(v, 'environment_id') || 'standard',
+    // Per-stage overrides on top of that default. Stored as JSON on the vertex
+    // because Gremlin single-cardinality properties are scalars.
+    stageEnvironments: parseStageEnvironments(getVal(v, 'stage_environments')),
   };
+};
+
+// A malformed stored value must not break reading a project: the map is a
+// binding, and losing it degrades to "everything on the default" rather than a
+// 500 on the project page.
+const parseStageEnvironments = (raw) => {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return validateStageEnvironments(parsed).map ?? {};
+  } catch {
+    return {};
+  }
 };
 
 const buildLegacyBinding = (project) => ({
@@ -983,12 +1000,17 @@ const handleProjectEnvironment = async (g, response, httpMethod, projectId, user
 
   try {
     if (httpMethod === 'GET') {
-      const result = await g.V().has('Project', 'id', projectId).valueMap('environment_id').next();
+      const result = await g
+        .V()
+        .has('Project', 'id', projectId)
+        .valueMap('environment_id', 'stage_environments')
+        .next();
       if (result.done) return response(404, { error: 'Project not found' });
       const environmentId = getVal(result.value, 'environment_id') || 'standard';
       const published = await readPublishedEnvironment(environmentId);
       return response(200, {
         environmentId,
+        stageEnvironments: parseStageEnvironments(getVal(result.value, 'stage_environments')),
         environment: published.environment,
         revision: published.revision,
       });
@@ -1017,15 +1039,23 @@ const handleProjectEnvironment = async (g, response, httpMethod, projectId, user
           code: 'ENVIRONMENT_KIND_NOT_DEFAULTABLE',
         });
       }
+      // Per-stage overrides. Validated here so a bad stage id or environment id
+      // is a 400 rather than something the orchestrator trips over at dispatch.
+      const bindings = validateStageEnvironments(data.stageEnvironments);
+      if (!bindings.valid) {
+        return response(400, { error: 'Invalid stageEnvironments', errors: bindings.errors });
+      }
       const updatedAt = new Date().toISOString();
       await g
         .V()
         .has('Project', 'id', projectId)
         .property(cardinality.single, 'environment_id', environmentId)
+        .property(cardinality.single, 'stage_environments', JSON.stringify(bindings.map))
         .property(cardinality.single, 'updated_at', updatedAt)
         .next();
       return response(200, {
         environmentId,
+        stageEnvironments: bindings.map,
         environment: published.environment,
         revision: published.revision,
         updatedAt,

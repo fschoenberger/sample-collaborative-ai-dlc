@@ -35,6 +35,11 @@ import {
   resolveEnvironmentSnapshot,
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
+import {
+  distinctEnvironmentIds,
+  mergeStageEnvironments,
+  validateStageEnvironments,
+} from '../shared/stage-environments.js';
 import { createProcessStore } from '../shared/v2-process-store.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
 import { buildResponse } from '../shared/response.js';
@@ -844,6 +849,15 @@ const fetchProjectConfig = async (g, projectId) => {
     mcpServersByTier: hasMcpServers ? mcpServersByTier : null,
     customRules: customRules.length ? customRules : null,
     environmentId: getVal(v, 'environment_id') || 'standard',
+    stageEnvironments: (() => {
+      const raw = getVal(v, 'stage_environments');
+      if (!raw) return {};
+      try {
+        return validateStageEnvironments(JSON.parse(raw)).map ?? {};
+      } catch {
+        return {};
+      }
+    })(),
     repos: ordered,
     repoProviders,
     trackers,
@@ -4970,11 +4984,56 @@ export const handler = async (event) => {
         }
         throw error;
       }
+
+      // Per-stage placement. The project's map is the base; this request may
+      // adjust it for THIS run only. Each distinct environment is resolved once
+      // and SNAPSHOTTED, so republishing an environment or changing the project
+      // binding cannot move where a running intent places its stages — the same
+      // guarantee the default environment snapshot already gives.
+      const requestedBindings = validateStageEnvironments(data.stageEnvironments);
+      if (!requestedBindings.valid) {
+        return response(400, {
+          error: 'Invalid stageEnvironments',
+          errors: requestedBindings.errors,
+        });
+      }
+      const boundStages = mergeStageEnvironments(
+        cfg.stageEnvironments,
+        data.stageEnvironments === undefined ? null : requestedBindings.map,
+      );
+      let stageEnvironments = null;
+      try {
+        const resolved = new Map();
+        for (const id of distinctEnvironmentIds(boundStages)) {
+          resolved.set(
+            id,
+            await resolveEnvironmentSnapshot({
+              ddb,
+              tableName: process.env.ENVIRONMENT_REGISTRY_TABLE,
+              environmentId: id,
+            }),
+          );
+        }
+        const byStage = {};
+        for (const [stageId, id] of Object.entries(boundStages)) {
+          byStage[stageId] = resolved.get(id);
+        }
+        stageEnvironments = Object.keys(byStage).length > 0 ? byStage : null;
+      } catch (error) {
+        if (isEnvironmentResolutionError(error)) {
+          return response(409, { error: error.message, code: error.code });
+        }
+        throw error;
+      }
+
       const meta = await store.createExecution({
         executionId: newIntentId,
         projectId,
         intentId: newIntentId,
         status: 'DRAFT',
+        // Per-stage placement, snapshotted. resolveStageTarget reads this back at
+        // dispatch, so a republished environment cannot move a running intent.
+        ...(stageEnvironments ? { stageEnvironments } : {}),
         workflowId,
         workflowVersion,
         aidlcRepoRef,
