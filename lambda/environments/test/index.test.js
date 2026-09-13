@@ -702,4 +702,185 @@ describe('managed environment handler', () => {
     expect(JSON.parse(response.body).error).toMatch(/create a cycle/);
     expect(store.createRevision).not.toHaveBeenCalled();
   });
+  describe('EC2 environments', () => {
+    const EC2_SPEC = {
+      platform: 'linux',
+      architecture: 'x86_64',
+      imageRef: 'ami-0aaaaaaaaaaaaaaaa',
+      instanceTypes: ['c7i.2xlarge'],
+      maxInstances: 2,
+      maxConcurrentPlacements: 1,
+      maxLifetimeSeconds: 7200,
+      stageTimeoutSeconds: 3600,
+      bootstrapTimeoutSeconds: 600,
+    };
+
+    const ec2Configured = () => {
+      vi.stubEnv('EXECUTOR_INSTANCE_PROFILE_ARN', 'arn:aws:iam::1:instance-profile/exec');
+      vi.stubEnv('EXECUTOR_SECURITY_GROUP_ID', 'sg-1');
+      vi.stubEnv('VALKEY_HOST', 'valkey.example.com');
+    };
+
+    // DescribeImages then CreateLaunchTemplate, in that order.
+    const ec2Client = (imageOverrides = {}) => ({
+      send: vi.fn(async (command) => {
+        const name = command?.constructor?.name ?? '';
+        if (name.includes('DescribeImages')) {
+          return {
+            Images: [
+              {
+                ImageId: 'ami-0aaaaaaaaaaaaaaaa',
+                State: 'available',
+                Architecture: 'x86_64',
+                ...imageOverrides,
+              },
+            ],
+          };
+        }
+        return { LaunchTemplate: { LaunchTemplateId: 'lt-9', LatestVersionNumber: 4 } };
+      }),
+    });
+
+    const ec2Store = (environment, revision) => ({
+      ...storeBase(),
+      getEnvironment: vi.fn().mockResolvedValue(environment),
+      getRevision: vi.fn().mockResolvedValue(revision),
+      createRevision: vi
+        .fn()
+        .mockResolvedValue({ revisionId: 'r-2', status: 'DRAFT', kind: 'EC2' }),
+      updateRevision: vi.fn(async (_e, revisionId, patch) => ({ revisionId, ...patch })),
+      updateEnvironment: vi.fn(async (environmentId, patch) => ({ environmentId, ...patch })),
+    });
+
+    it('revises an EC2 environment onto a new AMI, keeping its id and bindings', async () => {
+      // Recreating the environment instead would change its id and orphan every
+      // project's { stageId: environmentId } binding, so a PUT must revise.
+      ec2Configured();
+      const environment = {
+        environmentId: 'cpp-buildhost',
+        kind: 'EC2',
+        status: 'PUBLISHED',
+        currentRevisionId: 'r-1',
+        publishedRevisionId: 'r-1',
+        launchSpec: EC2_SPEC,
+      };
+      const store = ec2Store(environment, { revisionId: 'r-1', kind: 'EC2', launchSpec: EC2_SPEC });
+      const client = ec2Client();
+      const handler = createHandler({ store, ec2Client: client });
+
+      const response = await handler({
+        httpMethod: 'PUT',
+        path: '/environments/cpp-buildhost',
+        body: JSON.stringify({
+          launchSpec: { ...EC2_SPEC, imageRef: 'ami-0bbbbbbbbbbbbbbbb' },
+        }),
+        ...claims('platform-admin'),
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(store.createRevision).toHaveBeenCalledWith(
+        expect.objectContaining({
+          launchSpec: expect.objectContaining({ imageRef: 'ami-0bbbbbbbbbbbbbbbb' }),
+        }),
+      );
+      // A fresh launch template for the new revision, leaving the published one
+      // alone until this revision is published in turn.
+      expect(store.updateRevision).toHaveBeenCalledWith(
+        'cpp-buildhost',
+        'r-2',
+        expect.objectContaining({
+          status: 'READY',
+          launchTemplateId: 'lt-9',
+          launchTemplateVersion: '4',
+        }),
+      );
+      expect(JSON.parse(response.body).revision).toMatchObject({ status: 'READY' });
+    });
+
+    it('never runs the tool-recipe path for an EC2 environment', async () => {
+      // Falling through stored launchSpec: undefined and left a corrupt DRAFT as
+      // currentRevisionId.
+      ec2Configured();
+      const environment = {
+        environmentId: 'cpp-buildhost',
+        kind: 'EC2',
+        status: 'PUBLISHED',
+        currentRevisionId: 'r-1',
+        launchSpec: EC2_SPEC,
+      };
+      const store = ec2Store(environment, { revisionId: 'r-1', kind: 'EC2', launchSpec: EC2_SPEC });
+      const handler = createHandler({ store, ec2Client: ec2Client() });
+
+      await handler({
+        httpMethod: 'PUT',
+        path: '/environments/cpp-buildhost',
+        body: JSON.stringify({ launchSpec: EC2_SPEC }),
+        ...claims('platform-admin'),
+      });
+
+      expect(store.createRevision).toHaveBeenCalledWith(
+        expect.objectContaining({ launchSpec: expect.any(Object) }),
+      );
+      expect(store.createRevision).not.toHaveBeenCalledWith(
+        expect.objectContaining({ recipe: expect.anything() }),
+      );
+    });
+
+    it('rejects an invalid launch spec without creating a revision', async () => {
+      ec2Configured();
+      const environment = {
+        environmentId: 'cpp-buildhost',
+        kind: 'EC2',
+        status: 'PUBLISHED',
+        currentRevisionId: 'r-1',
+        launchSpec: EC2_SPEC,
+      };
+      const store = ec2Store(environment, { revisionId: 'r-1', kind: 'EC2', launchSpec: EC2_SPEC });
+      const handler = createHandler({ store, ec2Client: ec2Client() });
+
+      const response = await handler({
+        httpMethod: 'PUT',
+        path: '/environments/cpp-buildhost',
+        body: JSON.stringify({ launchSpec: { ...EC2_SPEC, architecture: 'sparc' } }),
+        ...claims('platform-admin'),
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(store.createRevision).not.toHaveBeenCalled();
+    });
+
+    it('fails the revision when the new AMI does not match the declared architecture', async () => {
+      // The image check IS the verification for an EC2 revision: it must exist, be
+      // available, and match the architecture the spec claims.
+      ec2Configured();
+      const environment = {
+        environmentId: 'cpp-buildhost',
+        kind: 'EC2',
+        status: 'PUBLISHED',
+        currentRevisionId: 'r-1',
+        launchSpec: EC2_SPEC,
+      };
+      const store = ec2Store(environment, { revisionId: 'r-1', kind: 'EC2', launchSpec: EC2_SPEC });
+      const handler = createHandler({
+        store,
+        ec2Client: ec2Client({ Architecture: 'arm64' }),
+      });
+
+      await handler({
+        httpMethod: 'PUT',
+        path: '/environments/cpp-buildhost',
+        body: JSON.stringify({ launchSpec: EC2_SPEC }),
+        ...claims('platform-admin'),
+      });
+
+      expect(store.updateRevision).toHaveBeenCalledWith(
+        'cpp-buildhost',
+        'r-2',
+        expect.objectContaining({
+          status: 'FAILED',
+          failure: expect.objectContaining({ code: 'IMAGE_UNUSABLE' }),
+        }),
+      );
+    });
+  });
 });

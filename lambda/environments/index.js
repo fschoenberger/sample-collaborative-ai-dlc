@@ -184,8 +184,10 @@ const assertEc2Configured = () => {
   return platform;
 };
 
-const readyEc2Revision = async ({ store, environment, revision, deps }) => {
-  const spec = revision.launchSpec;
+// Check the image and build the revision's launch template. `spec` is passed in
+// rather than read back off the revision row: the caller has just validated it,
+// and re-reading it would make this depend on the write having echoed it back.
+const readyEc2Revision = async ({ store, environment, revision, spec, deps }) => {
   const platform = assertEc2Configured();
 
   const assertions = imageAssertions(spec);
@@ -484,6 +486,7 @@ export const createHandler = ({
             store,
             environment: createdEc2.environment,
             revision: createdEc2.revision,
+            spec: validated.spec,
             deps,
           });
           return response(201, { ...createdEc2, revision: readied });
@@ -578,14 +581,45 @@ export const createHandler = ({
             error: 'The Standard environment follows the protected core runtime',
           });
         }
-        // An EC2 environment has no recipe to revise. Falling through would run
-        // prepareCatalogRecipe and store launchSpec: undefined, leaving a corrupt
-        // DRAFT as currentRevisionId. Recreate the environment instead.
+        // An EC2 environment revises its LAUNCH SPEC, not a tool recipe. It must be
+        // revisable: an AMI moves (patches, a newer toolchain), and recreating the
+        // environment instead would change its id and silently orphan every
+        // project's { stageId: environmentId } binding. The new revision gets its
+        // own launch template, leaving the published one intact until this revision
+        // is published in turn.
+        //
+        // Falling through to the AGENTCORE path is what must not happen: it would
+        // run prepareCatalogRecipe and store launchSpec: undefined, leaving a
+        // corrupt DRAFT as currentRevisionId.
         if ((environment.kind ?? 'AGENTCORE') === 'EC2') {
-          return response(409, {
-            error: 'An EC2 environment cannot be revised; create a new one with the desired AMI',
-            code: 'EC2_NOT_REVISABLE',
+          assertEc2Configured();
+          const ec2Data = parseBody(event);
+          const validated = validateEc2LaunchSpec(
+            ec2Data.launchSpec ?? { ...environment.launchSpec, ...ec2Data },
+          );
+          if (!validated.valid) {
+            return response(400, { error: 'Invalid launch spec', errors: validated.errors });
+          }
+          const revised = await store.createRevision({
+            environment,
+            launchSpec: validated.spec,
+            createdBy: actor,
+            reason: 'edited',
           });
+          const readied = await readyEc2Revision({
+            store,
+            environment,
+            revision: revised,
+            spec: validated.spec,
+            deps,
+          });
+          const updatedEc2 = await store.updateEnvironment(environmentId, {
+            ...(ec2Data.name?.trim() ? { name: ec2Data.name.trim() } : {}),
+            ...(ec2Data.description !== undefined
+              ? { description: String(ec2Data.description).trim() }
+              : {}),
+          });
+          return response(200, { environment: updatedEc2, revision: readied });
         }
         assertCatalogRevision(
           environmentId,
