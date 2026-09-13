@@ -377,6 +377,15 @@ export const validateEc2LaunchSpec = (input) => {
     }
   }
 
+  if (input.associatePublicIp === true) {
+    errors.push(
+      err(
+        'associatePublicIp',
+        "workers run in private subnets; a public IP would require a network-interface block that cannot coexist with the scheduler's subnet override",
+      ),
+    );
+  }
+
   const availabilityZones = validateStringList(input.availabilityZones, {
     field: 'availabilityZones',
     pattern: AZ_PATTERN,
@@ -422,10 +431,11 @@ export const validateEc2LaunchSpec = (input) => {
       input.workspaceOnInstanceStore == null
         ? EC2_LAUNCH_SPEC_DEFAULTS.workspaceOnInstanceStore
         : Boolean(input.workspaceOnInstanceStore),
-    associatePublicIp:
-      input.associatePublicIp == null
-        ? EC2_LAUNCH_SPEC_DEFAULTS.associatePublicIp
-        : Boolean(input.associatePublicIp),
+    // Always false. A public IP can only be requested through a NetworkInterfaces
+    // block, which cannot coexist with the subnet override the scheduler needs to
+    // spread placement and retry on capacity errors. Workers live in private
+    // subnets with NAT egress, so this costs nothing real.
+    associatePublicIp: false,
     securityGroupIds,
     additionalPolicyArns,
     workspacePath: String(input.workspacePath ?? EC2_LAUNCH_SPEC_DEFAULTS.workspacePath),

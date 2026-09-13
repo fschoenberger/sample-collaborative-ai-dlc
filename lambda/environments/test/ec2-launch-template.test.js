@@ -142,23 +142,29 @@ describe('launchTemplateInput', () => {
   });
 
   it('always attaches the platform security group, before any operator ones', () => {
-    const { NetworkInterfaces } = launchTemplateInput({
+    const { SecurityGroupIds } = launchTemplateInput({
       spec: spec({ securityGroupIds: ['sg-0abc1234'] }),
       environmentId: 'e',
       revisionId: 'r',
       platform: platform(),
     }).LaunchTemplateData;
-    expect(NetworkInterfaces[0].Groups).toEqual(['sg-platform', 'sg-0abc1234']);
+    expect(SecurityGroupIds).toEqual(['sg-platform', 'sg-0abc1234']);
   });
 
-  it('keeps instances off public IPs by default', () => {
-    const { NetworkInterfaces } = launchTemplateInput({
+  it('uses top-level security groups and NO network interfaces', () => {
+    // EC2 rejects a request carrying both a network-interface block and an
+    // instance-level subnet, and the scheduler's fleet overrides MUST set SubnetId
+    // to spread across AZs and retry on capacity errors. A NetworkInterfaces block
+    // here breaks every placement, which is exactly what happened the first time.
+    const data = launchTemplateInput({
       spec: spec(),
       environmentId: 'e',
       revisionId: 'r',
       platform: platform(),
     }).LaunchTemplateData;
-    expect(NetworkInterfaces[0].AssociatePublicIpAddress).toBe(false);
+    expect(data.NetworkInterfaces).toBeUndefined();
+    expect(data.SecurityGroupIds).toContain('sg-platform');
+    expect(data.SubnetId).toBeUndefined();
   });
 
   it('is idempotent per revision through its client token', () => {

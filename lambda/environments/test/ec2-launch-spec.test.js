@@ -205,6 +205,14 @@ describe('validateEc2LaunchSpec', () => {
     expect(fieldsOf(errors)).toContain(field);
   });
 
+  it('rejects an explicit request for a public IP', () => {
+    // It would need a network-interface block, which cannot coexist with the
+    // subnet override the scheduler relies on.
+    const { valid, errors } = validateEc2LaunchSpec({ ...baseSpec(), associatePublicIp: true });
+    expect(valid).toBe(false);
+    expect(fieldsOf(errors)).toContain('associatePublicIp');
+  });
+
   it('rejects reserved aws: tag keys', () => {
     const { valid, errors } = validateEc2LaunchSpec({
       ...baseSpec(),

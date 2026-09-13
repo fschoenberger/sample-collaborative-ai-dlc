@@ -126,14 +126,13 @@ export const launchTemplateInput = ({ spec, environmentId, revisionId, platform 
         HttpPutResponseHopLimit: 2,
       },
       Monitoring: { Enabled: false },
-      NetworkInterfaces: [
-        {
-          DeviceIndex: 0,
-          AssociatePublicIpAddress: Boolean(spec.associatePublicIp),
-          DeleteOnTermination: true,
-          Groups: [platform.securityGroupId, ...(spec.securityGroupIds ?? [])],
-        },
-      ],
+      // Top-level SecurityGroupIds, NOT a NetworkInterfaces block. EC2 rejects a
+      // request that carries both network interfaces and an instance-level subnet
+      // ("Network interfaces and an instance-level subnet ID may not be specified
+      // on the same request"), and the scheduler's CreateFleet overrides MUST set
+      // SubnetId to spread placement across AZs and fall back on capacity errors.
+      // So the subnet comes from the override and the groups come from here.
+      SecurityGroupIds: [platform.securityGroupId, ...(spec.securityGroupIds ?? [])],
       BlockDeviceMappings: [
         {
           DeviceName: platform.rootDeviceName ?? '/dev/xvda',
