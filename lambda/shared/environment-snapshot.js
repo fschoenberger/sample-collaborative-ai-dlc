@@ -122,7 +122,29 @@ export const resolvePublishedEnvironment = async ({
       'ENVIRONMENT_REVISION_INCOMPLETE',
     );
   }
-  if (revision.verification?.status !== 'PASSED') {
+  // Verification is an AGENTCORE concept. That kind builds an image here, so the
+  // image has to be proven — booted, probed, reported PASSED — before a run is
+  // allowed to depend on it.
+  //
+  // An EC2 revision builds nothing. The operator brings an AMI built outside this
+  // system, and what the platform can actually assert about it is asserted when the
+  // revision is readied: DescribeImages must confirm the image exists, is
+  // `available`, and matches the declared architecture, or the revision goes FAILED
+  // with IMAGE_UNUSABLE and can never publish. The launch template is then built
+  // from the validated spec, and the completeness check above proves it exists. So
+  // for EC2 those two checks ARE the verification, already enforced upstream, and
+  // demanding a `verification.status` that nothing in the EC2 lifecycle ever writes
+  // would make every EC2 environment permanently unusable — which is exactly what
+  // it did until this branch existed.
+  // AGENTCORE must be PROVEN passed. EC2 must merely not be proven BAD: absence is
+  // the normal state there, while a recorded failure still blocks — so an operator
+  // tool that does probe an AMI in future is honoured without this gate having to
+  // change again.
+  const verificationBlocks =
+    kind === 'EC2'
+      ? Boolean(revision.verification) && revision.verification.status !== 'PASSED'
+      : revision.verification?.status !== 'PASSED';
+  if (verificationBlocks) {
     throw environmentError(
       'Published environment revision is not verified',
       'ENVIRONMENT_REVISION_UNVERIFIED',

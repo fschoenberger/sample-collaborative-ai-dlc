@@ -164,7 +164,11 @@ describe('EC2 environment snapshots', () => {
     launchTemplateVersion: '2',
     launchSpec: { architecture: 'x86_64', instanceTypes: ['c7i.2xlarge'] },
     runtimeCompatibilityVersion: '2',
-    verification: { status: 'PASSED', clang: '23.1.0', cmake: '4.3.0' },
+    // Deliberately null: nothing in the EC2 lifecycle writes verification. The old
+    // fixture claimed PASSED here, which is a shape production never produces — so
+    // the suite was green while every real EC2 environment was rejected at intent
+    // creation with ENVIRONMENT_REVISION_UNVERIFIED.
+    verification: null,
   };
   const ec2Ddb = (revisionValue = ec2Revision, environmentValue = ec2Environment) => ({
     send: async (command) =>
@@ -209,10 +213,26 @@ describe('EC2 environment snapshots', () => {
     });
   });
 
-  it('still enforces verification and compatibility gates', async () => {
+  it('does not demand verification an EC2 revision never records', async () => {
+    // EC2 builds nothing, so nothing in its DRAFT -> READY -> PUBLISHED lifecycle
+    // ever writes verification. Requiring a PASSED status made every EC2
+    // environment permanently unusable: intent creation refused it with
+    // ENVIRONMENT_REVISION_UNVERIFIED. What IS asserted for EC2 is asserted at
+    // ready time — DescribeImages proving the AMI exists, is available and matches
+    // the declared architecture — plus the launch template the completeness check
+    // above already requires.
+    const snapshot = await resolve(ec2Ddb());
+    expect(snapshot.launchTemplateId).toBe('lt-0abc');
+  });
+
+  it('still blocks an EC2 revision whose verification was recorded as failed', async () => {
+    // Absence is normal; a recorded failure is not, and must not be ignored.
     await expect(
       resolve(ec2Ddb({ ...ec2Revision, verification: { status: 'FAILED' } })),
     ).rejects.toMatchObject({ code: 'ENVIRONMENT_REVISION_UNVERIFIED' });
+  });
+
+  it('still enforces the compatibility gate', async () => {
     await expect(
       resolve(ec2Ddb({ ...ec2Revision, runtimeCompatibilityVersion: '0' })),
     ).rejects.toMatchObject({ code: 'ENVIRONMENT_COMPATIBILITY_UNSUPPORTED' });
