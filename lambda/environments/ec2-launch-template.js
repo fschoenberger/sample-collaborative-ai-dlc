@@ -58,6 +58,10 @@ export const runnerEnvironment = ({ spec, environmentId, revisionId, platform })
   AWS_REGION: platform.region,
   RUNTIME_COMPATIBILITY_VERSION: String(platform.runtimeCompatibilityVersion ?? '1'),
   V2_WORKSPACE_DIR: spec.workspacePath ?? '/mnt/workspace',
+  // The reconciler enforces these, and a self-registering worker can only report
+  // them if it is told them.
+  AIDLC_MAX_LIFETIME_SECONDS: String(spec.maxLifetimeSeconds ?? 0),
+  AIDLC_BOOTSTRAP_TIMEOUT_SECONDS: String(spec.bootstrapTimeoutSeconds ?? 0),
 });
 
 /**

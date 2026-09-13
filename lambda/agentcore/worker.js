@@ -90,6 +90,8 @@ export const createWorker = ({
   clock = () => Date.now(),
   heartbeatMs = HEARTBEAT_MS,
   blockMs = CLAIM_BLOCK_MS,
+  maxLifetimeSeconds = 0,
+  bootstrapTimeoutSeconds = 0,
 }) => {
   const registry = createRegistry({ client, clock });
   let running = false;
@@ -253,13 +255,21 @@ export const createWorker = ({
   return {
     async start() {
       running = true;
+      // Register with the fields the RECONCILER needs, not just identity. It
+      // terminates by instanceId and enforces caps from maxLifetimeSeconds /
+      // bootstrapTimeoutSeconds; a self-registered worker missing them is
+      // unreapable and leaks an instance.
       await registry.putWorker({
         workerId,
         kind,
         environmentId,
         revisionId,
         state: 'IDLE',
+        instanceId: kind === 'EC2' ? workerId : null,
+        sessionId: kind === 'AGENTCORE' ? workerId : null,
         createdAtMs: clock(),
+        maxLifetimeSeconds,
+        bootstrapTimeoutSeconds,
       });
       await registry.ensureGroup(environmentId);
       const worker = await registry.getWorker(workerId);
@@ -324,6 +334,8 @@ export const main = async ({ env = process.env } = {}) => {
     kind: 'EC2',
     environmentId,
     revisionId,
+    maxLifetimeSeconds: Number(env.AIDLC_MAX_LIFETIME_SECONDS || 0),
+    bootstrapTimeoutSeconds: Number(env.AIDLC_BOOTSTRAP_TIMEOUT_SECONDS || 0),
     client,
     addressedClient,
     dispatchInvocation,

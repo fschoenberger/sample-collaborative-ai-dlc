@@ -22,7 +22,11 @@ const options = () => ({
   // A scheduler call sits in front of a stage dispatch; failing fast and letting
   // the orchestrator's retry handle it beats blocking the invocation.
   connectTimeout: 5000,
-  commandTimeout: 5000,
+  // NO commandTimeout. A worker's claim loop uses XREADGROUP/XREAD with BLOCK,
+  // which legitimately holds the connection open for the whole block window — a
+  // command timeout races it and reports 'Command timed out' every cycle, burning
+  // a reconnect and drowning real errors in noise. Liveness is covered properly by
+  // the lease (pending-entries idle time) and the worker heartbeat.
   maxRetriesPerRequest: 2,
   enableOfflineQueue: true,
   enableReadyCheck: true,
