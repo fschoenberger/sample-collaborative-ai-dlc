@@ -72,6 +72,10 @@ export const runnerEnvironment = ({ spec, environmentId, revisionId, platform })
   // The reconciler enforces these, and a self-registering worker can only report
   // them if it is told them.
   AIDLC_MAX_LIFETIME_SECONDS: String(spec.maxLifetimeSeconds ?? 0),
+  // One job per worker under per-stage-ephemeral. Set explicitly rather than left
+  // to the runner's default so the env file states the strategy's contract, and so
+  // a future pooling strategy raises it here where the strategy is known.
+  AIDLC_MAX_JOBS: String(spec.strategyId === 'per-stage-ephemeral' ? 1 : 0),
   AIDLC_BOOTSTRAP_TIMEOUT_SECONDS: String(spec.bootstrapTimeoutSeconds ?? 0),
 });
 

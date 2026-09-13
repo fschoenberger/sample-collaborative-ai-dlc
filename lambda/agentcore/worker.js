@@ -98,10 +98,28 @@ export const createWorker = ({
   blockMs = CLAIM_BLOCK_MS,
   maxLifetimeSeconds = 0,
   bootstrapTimeoutSeconds = 0,
+  // How many jobs this worker may claim before it stops asking for more.
+  //
+  // ONE, under per-stage-ephemeral — and that is a correctness requirement, not a
+  // tuning knob. The scheduler terminates a worker when its stage ends, but
+  // TerminateInstances returns immediately while the instance takes tens of seconds
+  // to actually die. In that window the outgoing worker's claim loop is still
+  // polling, so it XREADGROUPs the NEXT stage's entry into its own pending list and
+  // then dies holding it. The replacement worker boots, asks for new messages with
+  // '>', and there are none — the entry is not new, it is pending under a dead
+  // consumer — so it idles until the orchestrator's callback heartbeat expires 15
+  // minutes later. Observed exactly that: workspace-scaffold succeeded, then
+  // workspace-detection never started and timed out.
+  //
+  // A worker that stops claiming after its own job cannot steal a successor's work,
+  // which removes the race rather than narrowing it. A pooling strategy would raise
+  // this and would then also need the draining check this makes unnecessary.
+  maxJobs = Number(process.env.AIDLC_MAX_JOBS || 1),
 }) => {
   const registry = createRegistry({ client, clock });
   let running = false;
   let shuttingDown = false;
+  let jobsClaimed = 0;
   let heartbeatTimer = null;
 
   const runJob = async (job, { entryId = null } = {}) => {
@@ -203,7 +221,18 @@ export const createWorker = ({
             await registry.ackJob({ environmentId, entryId }).catch(() => {});
             continue;
           }
+          jobsClaimed += 1;
           await runJob(job, { entryId });
+          // Claimed its allotment: stop asking for work. The scheduler is already
+          // terminating this instance; continuing to poll would only let it take a
+          // job it cannot run.
+          if (maxJobs > 0 && jobsClaimed >= maxJobs) {
+            logger.error?.('[worker] job allotment used, no longer claiming', {
+              jobsClaimed,
+              maxJobs,
+            });
+            shuttingDown = true;
+          }
         }
       }
     }

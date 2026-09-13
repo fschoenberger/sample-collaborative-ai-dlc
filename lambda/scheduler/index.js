@@ -288,7 +288,23 @@ export const createScheduler = ({
     const provisioner = provisionerFor(worker.kind, provisioners);
     const result = await provisioner.terminate({ worker, target });
     await registry.removeWorker(worker);
-    return { ok: true, released: true, ...result };
+    // Forget the consumer too. A consumer name lives in the group until deleted, so
+    // under per-stage-ephemeral the group otherwise collects one dead consumer per
+    // instance ever launched. The return value is how many pending entries it still
+    // held: non-zero means it claimed a job and died without finishing, which is
+    // worth saying out loud — that is the shape of the bug where an outgoing worker
+    // stole its successor's job.
+    const strandedEntries = await registry.forgetConsumer({
+      environmentId: worker.environmentId,
+      workerId,
+    });
+    if (strandedEntries) {
+      console.error('[scheduler] released a worker still holding queue entries', {
+        workerId,
+        strandedEntries,
+      });
+    }
+    return { ok: true, released: true, ...result, strandedEntries };
   };
 
   const releaseExecution = async ({ executionId, environmentIds = [] }) => {

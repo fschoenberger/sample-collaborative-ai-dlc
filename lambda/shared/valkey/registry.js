@@ -56,6 +56,10 @@ const WORKER_LEASE_SECONDS = Number(process.env.WORKER_LEASE_SECONDS || 5 * 60);
 
 const JOB_TTL_SECONDS = 12 * 60 * 60;
 
+// Hard cap on queue depth. See enqueueJob: XACK does not remove entries, so without
+// this the stream grows forever.
+const QUEUE_MAXLEN = 10_000;
+
 const nowMs = () => Date.now();
 
 // Valkey hashes are flat string maps, so anything structured is JSON in one
@@ -287,9 +291,23 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   };
 
   // Unassigned work: any worker of this environment may claim it.
+  // MAXLEN on the XADD, because XACK does NOT remove an entry from the stream — it
+  // only clears it from the consumer group's pending list. Without a bound the queue
+  // grows for the lifetime of the environment: six entries were already sitting in a
+  // dev queue whose jobs had all long since finished. The cap is generous relative
+  // to any real backlog (a queue this deep means placement is broken, not busy), and
+  // '~' lets Valkey trim on node boundaries, which is materially cheaper.
   const enqueueJob = async ({ environmentId, jobId }) => {
     await ensureGroup(environmentId);
-    return client.xadd(environmentQueueKey(environmentId), '*', 'jobId', jobId);
+    return client.xadd(
+      environmentQueueKey(environmentId),
+      'MAXLEN',
+      '~',
+      String(QUEUE_MAXLEN),
+      '*',
+      'jobId',
+      jobId,
+    );
   };
 
   // Addressed work: this worker and no other. Used for a resume that must land on
@@ -342,11 +360,39 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     });
   };
 
-  const ackJob = async ({ environmentId, entryId }) =>
-    client.xack(environmentQueueKey(environmentId), CONSUMER_GROUP, entryId);
+  // ACK then DELETE. XACK alone leaves the entry in the stream forever — it only
+  // says "this consumer is done with it" — so a finished job would still occupy the
+  // queue. XDEL is what actually reclaims it; MAXLEN on the XADD is the backstop for
+  // entries nobody ever acks.
+  const ackJob = async ({ environmentId, entryId }) => {
+    const key = environmentQueueKey(environmentId);
+    const pipeline = client.pipeline();
+    pipeline.xack(key, CONSUMER_GROUP, entryId);
+    pipeline.xdel(key, entryId);
+    await pipeline.exec();
+  };
+
+  /**
+   * Forget a consumer that will never read again.
+   *
+   * A consumer name is registered in the group the first time it reads, and stays
+   * there forever unless deleted — so under per-stage-ephemeral the group collects
+   * one dead consumer per instance ever launched (six, in a dev environment that had
+   * run a handful of stages). Called on release, when we know the instance is going
+   * away.
+   *
+   * XGROUP DELCONSUMER returns how many pending entries that consumer still held;
+   * those are surfaced rather than swallowed, because a non-zero count means a job
+   * was claimed and never finished, which the caller may want to know about.
+   */
+  const forgetConsumer = async ({ environmentId, workerId }) =>
+    client
+      .xgroup('DELCONSUMER', environmentQueueKey(environmentId), CONSUMER_GROUP, workerId)
+      .catch(() => 0);
 
   return {
     ensureGroup,
+    forgetConsumer,
     putWorker,
     getWorker,
     listWorkers,
