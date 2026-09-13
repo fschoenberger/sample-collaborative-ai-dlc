@@ -15,7 +15,7 @@
 set -euxo pipefail
 
 # cloud-init runs user-data with no HOME, and several third-party installers
-# (npm, kiro) dereference it unconditionally. Set it before anything else.
+# (npm, and some CLI installers) dereference it unconditionally. Set it first.
 export HOME=${HOME:-/root}
 
 REPO=${1:-/opt/aidlc-dev}
@@ -65,16 +65,15 @@ node --version | grep -qF "v${NODE_VERSION}"
 # ── Agent CLIs ──────────────────────────────────────────────────────────────
 # Versions read from the Dockerfile for the same reason as Node: a stage must not
 # behave differently depending on where it was placed.
+# Claude Code and OpenCode only. discoverInstalledClis finds what is on PATH and
+# selectCli picks from what is available, so this is a complete worker; an AMI
+# that also wants Codex or Kiro is the operator's call to make.
 pin() { grep -E "^ARG $1=" "$DOCKERFILE" | head -1 | cut -d= -f2; }
 CLAUDE_CODE_VERSION=$(pin CLAUDE_CODE_VERSION)
-CODEX_VERSION=$(pin CODEX_VERSION)
 OPENCODE_VERSION=$(pin OPENCODE_VERSION)
-KIRO_CLI_VERSION=$(pin KIRO_CLI_VERSION)
 
-npm install -g --no-audit --no-fund \
-  "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}"
+npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 claude --version | grep -qF "${CLAUDE_CODE_VERSION}"
-codex --version | grep -qF "${CODEX_VERSION}"
 
 OPENCODE_ARCH=$([ "$ARCH" = "x64" ] && echo x64 || echo arm64)
 install -d /opt/opencode/bin
@@ -85,25 +84,6 @@ chmod +x /opt/opencode/bin/opencode
 ln -sf /opt/opencode/bin/opencode /usr/local/bin/opencode
 rm -f /tmp/opencode.tar.gz
 opencode --version | grep -qF "${OPENCODE_VERSION}"
-
-# Kiro is best-effort. Its installer is the most fragile of the four (it needs
-# HOME, does its own setup dance) and it authenticates with a separate Kiro API
-# key, so a worker without it still runs every Bedrock-backed CLI. A failure here
-# must not cost the whole AMI.
-KIRO_ARCH=$([ "$ARCH" = "x64" ] && echo x86_64 || echo aarch64)
-KIRO_OK=no
-if curl -fsSLo /tmp/kiro.zip \
-     "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-${KIRO_ARCH}-linux-musl.zip" \
-   && unzip -q /tmp/kiro.zip -d /tmp/kiro-cli \
-   && KIRO_CLI_SKIP_SETUP=1 HOME=/root /tmp/kiro-cli/kirocli/install.sh; then
-  install -d /opt/kiro
-  cp -a /root/.local/bin /opt/kiro/bin
-  ln -sf /opt/kiro/bin/kiro-cli /usr/local/bin/kiro-cli
-  KIRO_OK=yes
-else
-  echo "[ami] WARNING: kiro-cli install failed; continuing without it"
-fi
-rm -rf /tmp/kiro.zip /tmp/kiro-cli /root/.local
 
 # Bun, for the deterministic CODE sensors (they shell out to bunx eslint / tsc).
 curl -fsSL https://bun.sh/install | BUN_INSTALL=/opt/bun bash
@@ -174,9 +154,7 @@ cat > /etc/aidlc-worker-ami.json <<PROVENANCE
   "vcpkg": "$(git -C /opt/vcpkg rev-parse HEAD)",
   "node": "$(node --version)",
   "claudeCode": "${CLAUDE_CODE_VERSION}",
-  "codex": "${CODEX_VERSION}",
   "opencode": "${OPENCODE_VERSION}",
-  "kiroCli": "$([ "$KIRO_OK" = yes ] && echo "${KIRO_CLI_VERSION}" || echo "not-installed")",
   "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 PROVENANCE
