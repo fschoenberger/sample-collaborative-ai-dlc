@@ -108,6 +108,10 @@ const prepareCatalogRecipe = async (store, toolStore, input, baseEnvironmentId) 
 };
 
 const assertCatalogRevision = (environmentId, revision) => {
+  // EC2 revisions have no recipe at all — the operator brings an AMI, so there is
+  // no tool composition to be legacy about. Without this the guard rejects every
+  // EC2 revision as a "fixed-tool recipe" it cannot rebuild.
+  if (revision?.kind === 'EC2') return;
   if (
     environmentId !== 'standard' &&
     revision?.recipe?.schemaVersion !== CATALOG_RECIPE_SCHEMA_VERSION
