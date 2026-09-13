@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { __durableHandler } from '../index.js';
-import { makeEnqueueDouble } from './enqueue-double.js';
 
 // Stage-skipping behaviors of the durable orchestrator (shared/stage-skip.js):
 //   - intent-level skips (META.skipStageIds) ride load-plan, get SKIPPED audit
@@ -125,14 +124,12 @@ beforeEach(() => {
     },
     loadPlan: vi.fn(async () => ({ valid: true, plan: { stages: linearStages() } })),
     invokeRuntime: null,
-    enqueueStage: null,
     resolveToken: vi.fn(async () => 'tok'),
     stopSession: vi.fn(async () => ({ stopped: true })),
     broadcast: vi.fn(async () => {}),
     applicationUrl: 'https://aidlc.example.test/',
   };
   deps.invokeRuntime = makeRuntime(ctx, okScript);
-  deps.enqueueStage = makeEnqueueDouble((p, sid) => deps.invokeRuntime(p, sid));
 });
 
 const start = (event = {}) =>

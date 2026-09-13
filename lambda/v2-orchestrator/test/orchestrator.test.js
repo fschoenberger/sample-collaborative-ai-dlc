@@ -87,6 +87,19 @@ const MANAGED_RUNTIME_TARGET = {
   qualifier: 'revision_r_1',
 };
 
+// A per-stage EC2 override, snapshotted onto META the way lambda/intents projects
+// it. The intent DEFAULT stays AgentCore, which is the invariant that lets the
+// engine's own commands (init-ws, checkpoints, record-pr) keep running on the
+// intent's own session while a stage runs somewhere else entirely.
+const EC2_STAGE_ENVIRONMENT = {
+  kind: 'EC2',
+  environmentId: 'env-ec2',
+  revisionId: 'rev-7',
+  launchTemplateId: 'lt-7',
+  launchTemplateVersion: 3,
+  launchSpec: { strategyId: 'per-stage-ephemeral', maxInstances: 2 },
+};
+
 const META = {
   executionId: 'i1',
   intentId: 'i1',
@@ -142,10 +155,8 @@ beforeEach(() => {
       plan: { stages: [{ stageId: 'a' }, { stageId: 'b' }] },
     })),
     invokeRuntime: null, // bound to ctx below
-    // Stage placement. Stands in for scheduler + worker together: it records the
-    // placement decision inputs, then drives the SAME container fake the
-    // pre-scheduler path used, so every existing run-stage-start assertion stays
-    // meaningful while the new placement inputs are also observable.
+    // Placement of an EC2 stage. Only an EC2 stage reaches it — an AgentCore stage
+    // is dispatched straight through invokeRuntime above.
     enqueueStage: null, // bound to ctx below
     issueAgentCredentialGrant: vi.fn(async () => 'test-agent-credential-grant'),
     stopSession: vi.fn(async () => ({ stopped: true })),
@@ -155,18 +166,25 @@ beforeEach(() => {
     applicationUrl: 'https://aidlc.example.test/',
   };
   deps.invokeRuntime = makeRuntime(ctx, okScript);
-  deps.enqueueStage = vi.fn(makeEnqueue(deps));
+  deps.enqueueStage = makeEnqueue();
 });
 
-// The scheduler + worker, collapsed into one double. `enqueued` captures what the
-// orchestrator asked the scheduler for (target, session, callback); the payload is
-// then handed to the container fake exactly as a real worker would.
-const makeEnqueue = (deps) =>
-  vi.fn(async ({ payload, target, sessionId, stageCallbackId, resumeWorkerId, attempt }) => {
-    enqueued.push({ target, sessionId, stageCallbackId, resumeWorkerId, attempt });
-    const accepted = await deps.invokeRuntime(payload, sessionId);
-    if (!accepted?.ok) return accepted ?? { ok: false, reason: 'stage_dispatch_failed' };
-    return { ok: true, action: 'provision', jobId: `job-${enqueued.length}`, workerId: 'w-test' };
+// The scheduler and the EC2 worker that claims the job, collapsed into one double.
+// `enqueued` records what the orchestrator asked the scheduler for; the verdict then
+// comes back on the SAME durable callback an AgentCore stage completes, which is the
+// parity worth testing.
+//
+// It deliberately does NOT route through `invokeRuntime`: an EC2 runner reads a
+// queue and never calls InvokeAgentRuntime, so a test asserting that can only be
+// honest if the double does not either.
+const makeEnqueue = ({ verdict = { ok: true, state: 'SUCCEEDED' }, refuse = null } = {}) =>
+  vi.fn(async ({ payload, target, stageCallbackId, resumeWorkerId, attempt }) => {
+    enqueued.push({ target, payload, stageCallbackId, resumeWorkerId, attempt });
+    if (refuse) return refuse;
+    const resolve = ctx.stageCallbackResolvers.get(payload.stageCallbackId);
+    if (!resolve) throw new Error(`no stage callback registered: ${payload.stageCallbackId}`);
+    resolve(verdict);
+    return { ok: true, action: 'provision', jobId: `job-${enqueued.length}`, workerId: 'i-test' };
   });
 
 const stageStarts = () => invokes.filter((p) => p.command === 'run-stage-start');
@@ -203,16 +221,11 @@ describe('orchestrator durable handler', () => {
       repos: ['owner/repo'],
     });
     expect(initWs).not.toHaveProperty('gitToken');
-    // Engine container calls still carry the intent's runtime target. Stage
-    // dispatch no longer does: placement is the scheduler's job now, and the
-    // per-stage target it received is asserted through `enqueued` instead.
-    const engineTargets = deps.invokeRuntime.mock.calls
-      .filter(([payload]) => payload.command !== 'run-stage-start')
-      .map(([, , target]) => target);
-    expect(engineTargets).toEqual(
-      Array.from({ length: engineTargets.length }, () => MANAGED_RUNTIME_TARGET),
-    );
-    expect(enqueued.every((e) => e.target?.kind === 'AGENTCORE')).toBe(true);
+    // EVERY container call carries the intent's runtime target, stage dispatch
+    // included: an AgentCore stage is a runtime invoke, with no fleet in between.
+    const targets = deps.invokeRuntime.mock.calls.map(([, , target]) => target);
+    expect(targets).toEqual(Array.from({ length: targets.length }, () => MANAGED_RUNTIME_TARGET));
+    expect(deps.enqueueStage).not.toHaveBeenCalled();
     const statuses = deps.store.updateExecution.mock.calls.map((c) => c[0].status);
     expect(statuses).toContain('RUNNING');
     expect(statuses).toContain('SUCCEEDED');
@@ -224,16 +237,11 @@ describe('orchestrator durable handler', () => {
     expect(starts.length).toBe(2);
     for (const s of starts) {
       expect(s.stageCallbackId).toMatch(/^cb-stage-cb-/);
-      // The credential grant is deliberately NOT on the dispatched payload any
-      // more. It lives 300 seconds, and the gap between placing a job and a
-      // worker claiming it is an instance cold boot, so the scheduler mints it at
-      // claim time instead (scheduler `issue-grant`).
-      expect(s).not.toHaveProperty('agentCredentialGrant');
-    }
-    // …and every placement carries the binding the scheduler needs to mint it.
-    expect(enqueued).toHaveLength(2);
-    for (const placement of enqueued) {
-      expect(placement.stageCallbackId).toMatch(/^cb-stage-cb-/);
+      // An AgentCore dispatch IS the delivery, so the grant is minted here and
+      // rides along on the payload. There is no queue in between, and therefore no
+      // cold boot to race the 300s grant TTL. (An EC2 stage is the opposite case:
+      // the scheduler mints at claim time — see the EC2 dispatch tests.)
+      expect(s.agentCredentialGrant).toBe('test-agent-credential-grant');
     }
     // Distinct callback per stage attempt (attribution).
     expect(new Set(starts.map((s) => s.stageCallbackId)).size).toBe(2);
@@ -250,11 +258,92 @@ describe('orchestrator durable handler', () => {
     await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
 
     expect(deps.store.getExecution).toHaveBeenCalledWith('i1', { consistentRead: true });
-    // The pin reaches the SCHEDULER rather than being minted here: issuance moved
-    // to claim time so it cannot race the 300s grant TTL across a cold boot.
-    expect(deps.enqueueStage).toHaveBeenCalledWith(
-      expect.objectContaining({ credentialBinding: pinnedBinding, projectId: 'p1' }),
+    expect(deps.issueAgentCredentialGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ bindings: [pinnedBinding], projectId: 'p1' }),
     );
+  });
+
+  // Dispatch is the ONE place the two kinds of execution environment differ, and it
+  // differs because they are not the same kind of thing. EC2 is a fleet we own and
+  // pay for, so it gets a scheduler with leases, limits and a reaper. An AgentCore
+  // session is owned by the platform: nothing to launch, nothing to terminate,
+  // nothing to ration — so it gets an invoke, like every other container command.
+  describe('stage dispatch branches on the environment kind', () => {
+    const start = () =>
+      __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
+    const oneStage = (stageInstanceId = undefined) =>
+      deps.loadPlan.mockResolvedValue({
+        valid: true,
+        plan: { stages: [{ stageId: 'a', ...(stageInstanceId ? { stageInstanceId } : {}) }] },
+      });
+    const ec2Meta = (...stageIds) => ({
+      ...META,
+      stageEnvironments: Object.fromEntries(stageIds.map((id) => [id, EC2_STAGE_ENVIRONMENT])),
+    });
+
+    it('invokes the runtime for an AgentCore stage and never asks the scheduler', async () => {
+      oneStage();
+
+      await expect(start()).resolves.toMatchObject({ ok: true });
+
+      expect(deps.enqueueStage).not.toHaveBeenCalled();
+      expect(stageStarts()).toHaveLength(1);
+      // Onto the intent's own session: affinity is what keeps the checkout warm.
+      expect(sessions.at(-1)).toContain('aidlc-intent-i1');
+    });
+
+    it('places an EC2 stage on the scheduler and never invokes the runtime for it', async () => {
+      deps.store.getExecution = vi.fn(async () => ec2Meta('a'));
+      oneStage();
+
+      await expect(start()).resolves.toMatchObject({ ok: true });
+
+      expect(enqueued).toHaveLength(1);
+      expect(enqueued[0]).toMatchObject({
+        target: { kind: 'EC2', environmentId: 'env-ec2', revisionId: 'rev-7' },
+        attempt: 1,
+        resumeWorkerId: null,
+      });
+      // No grant on the payload: an instance cold boot would outlive the 300s TTL,
+      // so the scheduler mints it at claim time instead.
+      expect(enqueued[0].payload).not.toHaveProperty('agentCredentialGrant');
+      // An EC2 runner reads a queue. InvokeAgentRuntime is never on its path, and
+      // the runtime saw only the engine's own command.
+      expect(stageStarts()).toEqual([]);
+      expect(invokes.map((p) => p.command)).toEqual(['init-ws']);
+    });
+
+    it('mixes both kinds in one run, with both verdicts on the same durable callback', async () => {
+      // The tagged target decides how the payload TRAVELS. Nothing about the verdict
+      // path changes, which is exactly why one intent can mix the two at all.
+      deps.store.getExecution = vi.fn(async () => ec2Meta('b'));
+
+      await expect(start()).resolves.toEqual({ ok: true, intentId: 'i1', stages: 2 });
+
+      expect(stageStarts().map((p) => p.stageId)).toEqual(['a']);
+      expect(enqueued.map((e) => e.payload.stageId)).toEqual(['b']);
+      const callbackIds = [...stageStarts(), ...enqueued.map((e) => e.payload)].map(
+        (p) => p.stageCallbackId,
+      );
+      expect(callbackIds.every((id) => id.startsWith('cb-stage-cb-'))).toBe(true);
+      expect(new Set(callbackIds).size).toBe(2);
+    });
+
+    it('fails the stage with a typed reason when the scheduler refuses a placement', async () => {
+      deps.store.getExecution = vi.fn(async () => ec2Meta('a'));
+      oneStage('si-a');
+      deps.enqueueStage = makeEnqueue({
+        refuse: { ok: false, action: 'queue', reason: 'max_instances_reached' },
+      });
+
+      await expect(start()).resolves.toMatchObject({ ok: false, reason: 'stage_failed' });
+
+      const failCall = deps.store.updateExecution.mock.calls.find((c) => c[0].status === 'FAILED');
+      expect(failCall[0].failureReason).toContain('max_instances_reached');
+      expect(deps.store.failRunningStageAttempt).toHaveBeenCalledWith(
+        expect.objectContaining({ stageInstanceId: 'si-a', runtimeError: 'max_instances_reached' }),
+      );
+    });
   });
 
   it('parks on WAITING_FOR_HUMAN, binds a callback, then resumes', async () => {
@@ -709,6 +798,8 @@ describe('orchestrator durable handler', () => {
   });
 
   it('fails the stage when the container REFUSES the dispatch (accept-time failure)', async () => {
+    // The AgentCore arm of the dispatch branch: the invoke IS the delivery, so a
+    // refusal is a value that has to become a typed stage failure right here.
     deps.loadPlan.mockResolvedValue({ valid: true, plan: { stages: [{ stageId: 'a' }] } });
     deps.invokeRuntime = vi.fn(async (payload) => {
       invokes.push(payload);
@@ -725,6 +816,7 @@ describe('orchestrator durable handler', () => {
     expect(res.reason).toBe('stage_failed');
     const failCall = deps.store.updateExecution.mock.calls.find((c) => c[0].status === 'FAILED');
     expect(failCall[0].failureReason).toContain('job_already_running');
+    expect(deps.enqueueStage).not.toHaveBeenCalled();
   });
 
   it('fails (with reason + event) when init-ws returns ok:false instead of marching on', async () => {

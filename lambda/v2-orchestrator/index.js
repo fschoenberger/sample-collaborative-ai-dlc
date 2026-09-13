@@ -44,7 +44,7 @@ import {
 } from '../shared/v2-execution-plan.js';
 import { resolveSkipTo, skipTargetsFrom, resolveRecomposeSkips } from '../shared/stage-skip.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
-import { resolveRuntimeTarget, resolveStageTarget } from '../shared/runtime-target.js';
+import { EC2_KIND, resolveRuntimeTarget, resolveStageTarget } from '../shared/runtime-target.js';
 import {
   awaitEngineGate,
   parseChoice,
@@ -208,8 +208,8 @@ const livePayloadFor = (type, summary) => {
 // cross the source-control service boundary; credentials never enter this process.
 const defaultDeps = () => ({
   store: defaultStore,
-  // Stage placement. Both worker kinds go through here; the scheduler decides
-  // whether that means waking an AgentCore session or launching an instance.
+  // Placement of an EC2 stage. An AgentCore stage does not come through here — it
+  // is invoked directly, because there is no fleet to place it on.
   enqueueStage: (input) => defaultSchedulerOperation({ action: 'enqueue-stage', ...input }),
   dispatchToWorker: (input) => defaultSchedulerOperation({ action: 'dispatch', ...input }),
   releaseWorkers: (input) => defaultSchedulerOperation({ action: 'release', ...input }),
@@ -823,8 +823,8 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         cloneInputs: stageCloneInputs,
         reviewFeedback,
         // Where this stage is placed. Resolved per stage (not per intent) so a
-        // single run can mix AgentCore stages with EC2 ones; the scheduler owns
-        // the actual provisioning either way.
+        // single run can mix AgentCore stages with EC2 ones; `runStage` branches on
+        // the kind to choose how the payload gets there.
         stageTarget: resolveStageTarget(meta, stage.stageId, RUNTIME_ARN()),
         enqueueStage: deps.enqueueStage,
         credentialBinding,
@@ -1650,11 +1650,9 @@ const runStage = async (
     // callback result arrives to report the id.
     stageInstanceId,
     store,
-    // Placement (see resolveStageTarget). `enqueueStage` hands the job to the
-    // scheduler, which decides where it runs and gets it there — a queue an EC2
-    // instance polls, or the invoke that materializes an AgentCore session. Which
-    // of the two is the scheduler's business, not this file's. The VERDICT path is
-    // unchanged either way: the worker completes the same durable callback created
+    // Placement (see resolveStageTarget). An EC2 stage goes to the scheduler, which
+    // owns that fleet; an AgentCore stage is invoked from here. The VERDICT path is
+    // the same either way: the worker completes the same durable callback created
     // below, whichever kind of machine it is.
     stageTarget,
     enqueueStage,
@@ -1689,8 +1687,8 @@ const runStage = async (
     return result;
   };
 
-  // The stage payload. Identical whichever kind of worker runs it — that parity
-  // is the whole point of routing both kinds through one scheduler.
+  // The stage payload. Identical whichever kind of worker runs it; only the way it
+  // gets there differs.
   const stagePayload = () => ({
     command: 'run-stage-start',
     // Launch-latency anchor (cold start metric): stamped at dispatch,
@@ -1731,38 +1729,47 @@ const runStage = async (
     stageCallbackId,
   });
 
+  // Dispatch. This is the ONE place the two kinds of environment diverge.
+  //
+  //   EC2       a fleet we own and pay for. The scheduler provisions or reuses an
+  //             instance, records the job, and puts it on the queue that instance
+  //             polls — leases, limits and reaping all follow from ownership.
+  //   AGENTCORE nothing to own. InvokeAgentRuntime materializes the session (or
+  //             routes to the live one for this id) AND delivers the payload in one
+  //             call, exactly as every other container command in this file is
+  //             dispatched. `run-stage-start` accepts in milliseconds and completes
+  //             the callback itself, so nothing here waits for the stage.
+  //
+  // Both arms sit inside ONE memoized step, so a durable replay re-dispatches
+  // neither, and both are refused the same way — as a value the check below turns
+  // into a typed stage failure.
   const dispatch = await ctx.step(`run-${attemptKey}`, async () =>
-    enqueueStage({
-      executionId: ids.executionId,
-      stageId: stage.stageId,
-      stageInstanceId,
-      unitSlug,
-      // A resume is a distinct attempt, so it needs a distinct job id.
-      attempt: resumeFrom || reviewFeedback ? 2 : 1,
-      target: stageTarget,
-      stageCallbackId,
-      projectId: ids.projectId,
-      // A named provider, no secret. The grant itself is NOT minted here, because
-      // it lives 300s and for a queued job the gap to a worker claiming it is an
-      // instance cold boot. The scheduler mints from this binding at the moment the
-      // payload actually reaches a worker — claim time for queued work, dispatch
-      // time for an invoke.
-      credentialBinding,
-      // AgentCore places onto THIS session, because affinity is what keeps the
-      // checkout warm between stages. Ignored for an EC2 target.
-      sessionId,
-      // A parked AgentCore session is released on park and re-materialized by the
-      // next placement, so its resume is an ordinary placement. Only an EC2 worker
-      // held across a park (parkPolicy: hold) needs addressing, and the scheduler
-      // resolves that from the registry rather than the orchestrator tracking
-      // worker ids.
-      resumeWorkerId: null,
-      payload: stagePayload(),
-    }),
+    stageTarget?.kind === EC2_KIND
+      ? enqueueStage({
+          executionId: ids.executionId,
+          stageId: stage.stageId,
+          stageInstanceId,
+          unitSlug,
+          // A resume is a distinct attempt, so it needs a distinct job id.
+          attempt: resumeFrom || reviewFeedback ? 2 : 1,
+          target: stageTarget,
+          stageCallbackId,
+          projectId: ids.projectId,
+          // A named provider, no secret. The grant itself is NOT minted here: it
+          // lives 300s and the gap to a worker claiming a queued job is an instance
+          // cold boot, so the scheduler mints from this binding at claim time.
+          credentialBinding,
+          // Only a worker held across a park (parkPolicy: hold) needs addressing,
+          // and the scheduler resolves that from the registry rather than the
+          // orchestrator tracking worker ids.
+          resumeWorkerId: null,
+          payload: stagePayload(),
+        })
+      : invokeRuntime(stagePayload(), sessionId),
   );
   // The accept response only says "job placed" — a refusal (capacity exhausted, a
-  // provisioner failure, an unresolvable target) fails the stage HERE; the verdict
-  // for a placed job always travels through the callback.
+  // provisioner failure, an unknown command on an old container) fails the stage
+  // HERE; the verdict for a placed job always travels through the callback.
   if (!dispatch || dispatch.ok === false || dispatch.error) {
     return reconcileFailure({
       ok: false,

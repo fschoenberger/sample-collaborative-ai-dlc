@@ -32,26 +32,21 @@ import {
 
 export const WORKER_STATES = ['PROVISIONING', 'IDLE', 'BUSY', 'DRAINING', 'TERMINATED'];
 
-// AN EC2 WORKER ROW IS A LEASE. AN AGENTCORE ROW IS NOT.
+// A WORKER ROW IS A LEASE.
 //
-// For an EC2 worker the expiry is not garbage collection — it is the liveness
-// signal. The worker holds its row by renewing the TTL on every heartbeat (30s from
-// its poll loop); when it stops renewing, the row expires and the worker is gone,
-// with nothing having to compare timestamps or run a sweep to notice. Five minutes
-// is ten missed beats: generous enough that a brief Valkey blip cannot evict a
-// healthy worker, tight enough that a dead one stops counting against maxInstances
-// within a stage's lifetime. A launch that never boots losing its row after five
-// minutes is not a false positive — the row is claiming a worker exists, and none
-// does.
+// The expiry is not garbage collection — it is the liveness signal. The worker holds
+// its row by renewing the TTL on every heartbeat (30s from its poll loop); when it
+// stops renewing, the row expires and the worker is gone, with nothing having to
+// compare timestamps or run a sweep to notice. Five minutes is ten missed beats:
+// generous enough that a brief Valkey blip cannot evict a healthy worker, tight
+// enough that a dead one stops counting against maxInstances within a stage's
+// lifetime. A launch that never boots losing its row after five minutes is not a
+// false positive — the row is claiming a worker exists, and none does.
 //
-// An AgentCore row is a PLACEMENT RECORD and carries NO EXPIRY AT ALL. Nothing ever
-// beats it: the scheduler writes it, and that session's liveness belongs to the
-// Bedrock AgentCore platform (see lambda/scheduler/provisioners.js). It is removed
-// by release, explicitly. Giving it a TTL — even a long one picked so it "never
-// fires in practice" — would be an expiry that means nothing, which is exactly what
-// the 12h WORKER_TTL_SECONDS this replaces was: a number nobody renewed, and
-// therefore a row whose disappearance carried no information and whose survival
-// carried none either.
+// That is also why every row in here is an EC2 instance. A row nobody renews has no
+// answer to "what expiry?": a long one picked so it "never fires in practice" is a
+// number pretending to be a signal, which is exactly what the 12h
+// WORKER_TTL_SECONDS this design replaced was.
 //
 // EXPIRY REMOVES A ROW, NEVER AN INSTANCE. Nothing here can call
 // TerminateInstances, so a runner that dies while its instance keeps running
@@ -136,10 +131,8 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     // Same hash tag, so these land in one slot and can pipeline safely.
     const pipeline = client.pipeline();
     pipeline.hset(key, flat);
-    // Only an EC2 row gets a lease, because only an EC2 worker beats to renew it.
-    // An AgentCore row is removed by release, not by expiry, so it gets no TTL —
-    // one that nothing renews would be a number, not a signal.
-    if (worker.kind === 'EC2') pipeline.expire(key, WORKER_LEASE_SECONDS);
+    // The lease starts here and is the worker's to hold; see the header.
+    pipeline.expire(key, WORKER_LEASE_SECONDS);
     await pipeline.exec();
     // Different tag ({e:…}), so this is a separate round trip by necessity.
     await client.sadd(environmentWorkersKey(worker.environmentId), worker.workerId);
@@ -228,14 +221,11 @@ export const createRegistry = ({ client, clock = nowMs }) => {
    */
   const heartbeat = async (workerId) => {
     const key = workerMetaKey(workerId);
-    const kind = await client.hget(key, 'kind');
-    if (kind === null) return false;
+    if (!(await client.exists(key))) return false;
     const pipeline = client.pipeline();
     pipeline.hset(key, { lastSeenAtMs: String(clock()) });
-    // The lease, renewed. Read the row's own kind rather than trusting the caller:
-    // an AgentCore row must not acquire an expiry it has no beat to renew, and this
-    // is the only place a lease is ever extended.
-    if (kind === 'EC2') pipeline.expire(key, WORKER_LEASE_SECONDS);
+    // The lease, renewed. This is the only place it is ever extended.
+    pipeline.expire(key, WORKER_LEASE_SECONDS);
     await pipeline.exec();
     return true;
   };

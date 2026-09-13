@@ -1,18 +1,13 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import Valkey from 'iovalkey';
 import { createRegistry } from '../../shared/valkey/registry.js';
-import {
-  CONSUMER_GROUP,
-  environmentQueueKey,
-  workerMetaKey,
-  workerStreamKey,
-} from '../../shared/valkey/keys.js';
+import { CONSUMER_GROUP, environmentQueueKey } from '../../shared/valkey/keys.js';
 import { createScheduler } from '../index.js';
 
 // The registry here is the REAL one against the REAL Valkey container. Only the
-// provisioners are stubbed, because CreateFleet and InvokeAgentRuntime are the
-// only parts that cannot run in a test. That keeps the interesting behaviour —
-// what actually lands on which stream, and in what order — genuinely exercised.
+// provisioner is stubbed, because CreateFleet is the only part that cannot run in
+// a test. That keeps the interesting behaviour — what actually lands on which
+// stream, and in what order — genuinely exercised.
 const host = process.env.VALKEY_HOST;
 const port = Number(process.env.VALKEY_PORT || 6379);
 
@@ -37,36 +32,16 @@ const ec2Target = (environmentId, overrides = {}) => ({
   },
 });
 
-const agentcoreTarget = (environmentId) => ({
-  kind: 'AGENTCORE',
-  environmentId,
-  revisionId: 'r-1',
-  agentRuntimeArn: 'arn:aws:bedrock-agentcore:eu-central-1:1:runtime/std',
-});
-
 const stubProvisioners = ({ ec2Fails = null } = {}) => {
   const ec2 = {
     kind: 'EC2',
-    delivery: 'queue',
     provision: vi.fn(async ({ workerId }) => {
       if (ec2Fails) throw Object.assign(new Error('no capacity'), { code: ec2Fails });
       return { workerId, instanceId: `i-${workerId.slice(-8)}`, fleetId: 'fleet-1' };
     }),
     terminate: vi.fn(async () => ({ terminated: true })),
   };
-  const agentcore = {
-    kind: 'AGENTCORE',
-    delivery: 'invoke',
-    provision: vi.fn(async ({ workerId }) => ({
-      workerId,
-      sessionId: workerId,
-      instanceId: null,
-      fleetId: null,
-      delivered: true,
-    })),
-    terminate: vi.fn(async () => ({ terminated: true })),
-  };
-  return { EC2: ec2, AGENTCORE: agentcore, ec2Stub: ec2, agentcoreStub: agentcore };
+  return { EC2: ec2, ec2Stub: ec2 };
 };
 
 const stageRequest = (target, overrides = {}) => ({
@@ -190,139 +165,19 @@ describe.skipIf(!host)('scheduler', () => {
       expect(job).toMatchObject({ state: 'FAILED', failureReason: 'PROVISION_NO_CAPACITY' });
     });
 
-    it('invokes an AgentCore session using the session id as the worker id', async () => {
+    it('refuses a target it does not own instead of inventing a worker for it', async () => {
+      // The scheduler manages a fleet WE pay for. An AgentCore session is not part
+      // of it — the orchestrator invokes the runtime directly — so a non-EC2 target
+      // here is a routing bug. Handling it quietly is how a row nobody leases and
+      // nobody reaps got into the registry.
       const environmentId = nextEnv();
-      const provisioners = stubProvisioners();
-      const scheduler = schedulerWith(provisioners);
-      const sessionId = 'aidlc-intent-abc0000000000000000000';
-
-      const result = await scheduler.enqueueStage(
-        stageRequest(agentcoreTarget(environmentId), { sessionId }),
-      );
-
-      expect(result).toMatchObject({ ok: true, workerId: sessionId });
-      expect(provisioners.agentcoreStub.provision).toHaveBeenCalledWith(
-        expect.objectContaining({ workerId: sessionId }),
-      );
-      expect((await registry.getWorker(sessionId)).kind).toBe('AGENTCORE');
-    });
-
-    it('carries the job payload ON the AgentCore invoke and never queues it', async () => {
-      // An AgentCore session is paused when idle, so it is not polling anything.
-      // Work put on the queue for it would sit there until the stage timed out.
-      const environmentId = nextEnv();
-      const provisioners = stubProvisioners();
-      const scheduler = schedulerWith(provisioners);
-
-      await scheduler.enqueueStage(
-        stageRequest(agentcoreTarget(environmentId), { sessionId: 'aidlc-intent-abc' }),
-      );
-
-      expect(provisioners.agentcoreStub.provision).toHaveBeenCalledWith(
-        expect.objectContaining({
-          payload: expect.objectContaining({
-            command: 'run-stage-start',
-            stageCallbackId: 'cb-1',
-          }),
-        }),
-      );
-      expect(await client.xlen(environmentQueueKey(environmentId))).toBe(0);
-    });
-
-    it('records an invoke-delivered worker as BUSY holding the job, not PROVISIONING', async () => {
-      // PROVISIONING would be a lie the reconciler acts on: it releases a worker
-      // that never registers within bootstrapTimeoutSeconds, and an AgentCore
-      // session never registers because it runs no poll loop.
-      const environmentId = nextEnv();
-      const scheduler = schedulerWith(stubProvisioners());
-      const sessionId = 'aidlc-intent-busy';
-
-      const result = await scheduler.enqueueStage(
-        stageRequest(agentcoreTarget(environmentId), { sessionId }),
-      );
-
-      expect(await registry.getWorker(sessionId)).toMatchObject({
-        state: 'BUSY',
-        currentJobId: result.jobId,
-      });
-    });
-
-    it('delivers a resumed AgentCore stage instead of addressing a paused session', async () => {
-      // REGRESSION: a resume used to take the reuse branch and XADD to the worker's
-      // addressed stream. For AgentCore that stream has no reader — the session was
-      // released on park — so every park-resume hung until the callback heartbeat
-      // expired. Reuse and delivery collapse into one invoke for this kind.
-      const environmentId = nextEnv();
-      const provisioners = stubProvisioners();
-      const scheduler = schedulerWith(provisioners);
-      const sessionId = 'aidlc-intent-parked';
-
-      await scheduler.enqueueStage(stageRequest(agentcoreTarget(environmentId), { sessionId }));
-      provisioners.agentcoreStub.provision.mockClear();
-
-      const resumed = await scheduler.enqueueStage(
-        stageRequest(agentcoreTarget(environmentId), {
-          sessionId,
-          resumeWorkerId: sessionId,
-          stageInstanceId: 's-1',
-          attempt: 2,
-        }),
-      );
-
-      expect(resumed.ok).toBe(true);
-      expect(provisioners.agentcoreStub.provision).toHaveBeenCalledTimes(1);
-      expect(await client.xlen(workerStreamKey(sessionId))).toBe(0);
-    });
-
-    it('mints the credential grant onto the invoke payload', async () => {
-      // Queued work is granted at claim time, a cold boot later. Invoked work has
-      // no such gap, so the grant rides along and the worker never round-trips.
-      const environmentId = nextEnv();
-      const provisioners = stubProvisioners();
-      const issued = vi.fn(async () => 'grant-token');
-      const scheduler = schedulerWith(provisioners, { issueAgentCredentialGrantFn: issued });
-
-      await scheduler.enqueueStage(
-        stageRequest(agentcoreTarget(environmentId), {
-          sessionId: 'aidlc-intent-grant',
-          credentialBinding: { provider: 'github-oauth', source: 'platform' },
-        }),
-      );
-
-      expect(issued).toHaveBeenCalledWith(
-        expect.objectContaining({ bindings: [{ provider: 'github-oauth', source: 'platform' }] }),
-      );
-      expect(provisioners.agentcoreStub.provision).toHaveBeenCalledWith(
-        expect.objectContaining({
-          payload: expect.objectContaining({ agentCredentialGrant: 'grant-token' }),
-        }),
-      );
-    });
-
-    it('refuses an AgentCore placement with no session id', async () => {
-      // Affinity is the whole reason the checkout survives between stages, so a
-      // missing session id is a bug to surface, never a value to invent.
-      const environmentId = nextEnv();
-      const scheduler = schedulerWith(stubProvisioners());
       await expect(
-        scheduler.enqueueStage(stageRequest(agentcoreTarget(environmentId))),
-      ).rejects.toMatchObject({ code: 'SESSION_ID_REQUIRED' });
-    });
-
-    it('never refuses an AgentCore placement for capacity', async () => {
-      // AgentCore bounds its own concurrency; adding ours would only be a second,
-      // worse limit.
-      const environmentId = nextEnv();
-      const scheduler = schedulerWith(stubProvisioners());
-      for (const n of [1, 2, 3]) {
-        const result = await scheduler.enqueueStage(
-          stageRequest(agentcoreTarget(environmentId), {
-            sessionId: `aidlc-intent-session${n}000000000000000`,
-            stageInstanceId: `s-${n}`,
-          }),
-        );
-        expect(result.ok).toBe(true);
-      }
+        schedulerWith(stubProvisioners()).enqueueStage(
+          stageRequest({ kind: 'AGENTCORE', environmentId, revisionId: 'r-1' }),
+        ),
+      ).rejects.toMatchObject({ code: 'UNSUPPORTED_TARGET_KIND' });
+      expect(await client.xlen(environmentQueueKey(environmentId))).toBe(0);
+      expect(await registry.listWorkers(environmentId)).toEqual([]);
     });
 
     it('refuses a request with no resolved target', async () => {
@@ -525,33 +380,6 @@ describe.skipIf(!host)('scheduler', () => {
 
       expect(result.timedOut).toEqual([]);
       expect(await registry.getWorker(workerId)).not.toBeNull();
-    });
-
-    it('leaves an AgentCore placement record alone — no lease, no expiry, no sweep', async () => {
-      // An AgentCore row never heartbeats by design: the platform owns that
-      // session's liveness. So it carries no expiry and is removed on release. A
-      // lease here — or any liveness check in the sweep — would drop the row of a
-      // session that is mid-stage, and dropping the row is what makes the scheduler
-      // stop the session.
-      const environmentId = nextEnv();
-      let now = 1_000_000;
-      const provisioners = stubProvisioners();
-      const scheduler = schedulerWith(provisioners, {
-        describeInstances: noInstances,
-        clock: () => now,
-      });
-      const sessionId = 'aidlc-intent-quiet';
-      await scheduler.enqueueStage(stageRequest(agentcoreTarget(environmentId), { sessionId }));
-
-      now += 3_600_000;
-      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
-
-      expect(result).toMatchObject({ timedOut: [], expired: [] });
-      expect(await registry.getWorker(sessionId)).not.toBeNull();
-      // -1 is "exists, no expiry". Not a long TTL: an expiry nothing renews is a
-      // number pretending to be a signal.
-      expect(await client.ttl(workerMetaKey(sessionId))).toBe(-1);
-      expect(provisioners.agentcoreStub.terminate).not.toHaveBeenCalled();
     });
 
     it('releases a worker past its lifetime cap', async () => {

@@ -131,31 +131,7 @@ describe.skipIf(!host)('registry against a real Valkey', () => {
       expect(await client.smembers(`{e:${environmentId}}:workers`)).toEqual([]);
     });
 
-    it('leases an EC2 row and gives an AgentCore row no expiry at all', async () => {
-      // The EC2 row IS the lease: its worker renews it from the poll loop. Nothing
-      // beats an AgentCore row — it is a placement record removed on release — so it
-      // gets no TTL. A long one picked so it "never fires" would be an expiry that
-      // means nothing, which is the 12h TTL this design replaced.
-      const registry = registryFor();
-      const environmentId = nextEnv();
-      const instance = worker({ environmentId });
-      const session = worker({
-        environmentId,
-        kind: 'AGENTCORE',
-        state: 'BUSY',
-        workerId: 'aidlc-intent-lease',
-      });
-      await registry.putWorker(instance);
-      await registry.putWorker(session);
-
-      const instanceTtl = await client.ttl(`{w:${instance.workerId}}:meta`);
-      expect(instanceTtl).toBeGreaterThan(0);
-      expect(instanceTtl).toBeLessThanOrEqual(5 * 60);
-      // -1 is "exists, no expiry"; -2 would be "gone".
-      expect(await client.ttl(`{w:${session.workerId}}:meta`)).toBe(-1);
-    });
-
-    it('leases a PROVISIONING row exactly like any other EC2 row', async () => {
+    it('leases a PROVISIONING row exactly like any other row', async () => {
       // A launching instance is not a special case. If its runner never boots, the
       // row expiring is accurate — it was claiming a worker exists and none does —
       // and reapOrphans is what terminates the instance if one did come up. Any
