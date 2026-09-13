@@ -54,6 +54,19 @@ const SUBNET_IDS = () =>
 // waiting out its own clock.
 const LEASE_IDLE_MS = () => Number(process.env.LEASE_IDLE_MS || 5 * 60 * 1000);
 
+// Which worker kinds run a heartbeat, and are therefore judged dead when it
+// stops. EC2 workers beat every 30s from their poll loop. AgentCore workers do
+// not beat at all — their row is a placement record written by the scheduler, and
+// their liveness belongs to the platform (see provisioners.js) — so silence from
+// one means nothing and must not be read as death.
+const HEARTBEATING_KINDS = new Set(['EC2']);
+
+// How long a heartbeating worker may stay silent before the reconciler writes it
+// off. Ten beats at the worker's 30s interval: long enough that a slow sweep or a
+// brief Valkey blip cannot kill a healthy worker, short enough that a dead one
+// stops counting against maxInstances within a stage's lifetime.
+const WORKER_SILENT_MS = () => Number(process.env.WORKER_SILENT_MS || 5 * 60 * 1000);
+
 const jobIdFor = ({ executionId, stageInstanceId, attempt }) =>
   `job-${executionId}-${stageInstanceId}-${attempt ?? 1}`;
 
@@ -82,6 +95,7 @@ export const createScheduler = ({
   subnetIds = SUBNET_IDS(),
   describeInstances = (input) => ec2.send(new DescribeInstancesCommand(input)),
   leaseIdleMs = LEASE_IDLE_MS(),
+  workerSilentMs = WORKER_SILENT_MS(),
   issueAgentCredentialGrantFn = (claims) => issueAgentCredentialGrant(ssm, claims),
   clock = () => Date.now(),
 } = {}) => {
@@ -366,8 +380,11 @@ export const createScheduler = ({
    *   2. bootstrap timeouts — an instance that launched but never registered,
    *                           which is what a broken AMI or a failed runner
    *                           bundle fetch looks like.
-   *   3. lifetime caps      — a worker older than its spec allows.
-   *   4. orphan instances   — running and tagged as ours, but absent from the
+   *   3. silent workers     — a heartbeating kind that stopped beating. This is
+   *                           the only check that can remove a row whose spec
+   *                           carries no age caps, which is why it exists.
+   *   4. lifetime caps      — a worker older than its spec allows.
+   *   5. orphan instances   — running and tagged as ours, but absent from the
    *                           registry. This is the check that makes Valkey
    *                           disposable: EC2 is the authority on what exists.
    */
@@ -376,6 +393,7 @@ export const createScheduler = ({
     const abandoned = [];
     const timedOut = [];
     const expired = [];
+    const silent = [];
 
     for (const environmentId of environmentIds) {
       for (const entry of await registry.claimAbandoned({ environmentId, idleMs: leaseIdleMs })) {
@@ -402,6 +420,25 @@ export const createScheduler = ({
           timedOut.push(worker.workerId);
           continue;
         }
+        // A worker that stopped beating is gone. Without this check the ONLY
+        // things that can remove a row are the two age caps above, and both are
+        // disabled when their spec value is 0 — so a worker that registered,
+        // never got a job and then died sat in the registry until its 12h TTL,
+        // counting against maxInstances the whole time. (Found exactly one such
+        // row in the dev registry: state IDLE, last beat five minutes after
+        // creation, instance long since terminated.)
+        //
+        // Gated on the kinds that actually heartbeat. An AgentCore row never
+        // beats — it is a placement record, not a poll loop — so applying this to
+        // it would call StopRuntimeSession on a session mid-stage.
+        if (HEARTBEATING_KINDS.has(worker.kind) && worker.state !== 'PROVISIONING') {
+          const sinceBeatMs = now - (worker.lastSeenAtMs || worker.createdAtMs);
+          if (sinceBeatMs > workerSilentMs) {
+            await releaseWorker({ workerId: worker.workerId });
+            silent.push(worker.workerId);
+            continue;
+          }
+        }
         if (worker.maxLifetimeSeconds > 0 && ageSeconds > worker.maxLifetimeSeconds) {
           await releaseWorker({ workerId: worker.workerId });
           expired.push(worker.workerId);
@@ -410,7 +447,7 @@ export const createScheduler = ({
     }
 
     const orphans = await reapOrphans({ environmentIds });
-    return { ok: true, abandoned, timedOut, expired, orphans };
+    return { ok: true, abandoned, timedOut, expired, silent, orphans };
   };
 
   // EC2 is the authority on which instances exist. Anything running with our tag

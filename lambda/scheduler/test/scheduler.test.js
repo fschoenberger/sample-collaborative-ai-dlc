@@ -522,6 +522,97 @@ describe.skipIf(!host)('scheduler', () => {
       expect(await registry.getWorker(workerId)).not.toBeNull();
     });
 
+    it('releases a heartbeating worker that went silent, even with no age caps set', async () => {
+      // REGRESSION: with maxLifetimeSeconds and bootstrapTimeoutSeconds both 0 the
+      // two age checks are disabled, and nothing else could remove the row — so a
+      // worker that registered, never got a job and then died counted against
+      // maxInstances until its 12h TTL. One such row was found in the dev registry.
+      const environmentId = nextEnv();
+      let now = 1_000_000;
+      const scheduler = schedulerWith(stubProvisioners(), {
+        describeInstances: noInstances,
+        clock: () => now,
+        workerSilentMs: 300_000,
+      });
+      const { workerId } = await scheduler.enqueueStage(
+        stageRequest(
+          ec2Target(environmentId, { maxLifetimeSeconds: 0, bootstrapTimeoutSeconds: 0 }),
+        ),
+      );
+      // Self-registration: the runner reports IDLE and starts beating.
+      await registry.putWorker({
+        workerId,
+        kind: 'EC2',
+        environmentId,
+        revisionId: 'r-1',
+        state: 'IDLE',
+        instanceId: workerId,
+        createdAtMs: now,
+        maxLifetimeSeconds: 0,
+        bootstrapTimeoutSeconds: 0,
+      });
+
+      now += 301_000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.silent).toEqual([workerId]);
+      expect(await registry.getWorker(workerId)).toBeNull();
+    });
+
+    it('leaves a worker that is still beating alone', async () => {
+      const environmentId = nextEnv();
+      let now = 1_000_000;
+      const scheduler = schedulerWith(stubProvisioners(), {
+        describeInstances: noInstances,
+        clock: () => now,
+        workerSilentMs: 300_000,
+      });
+      const { workerId } = await scheduler.enqueueStage(
+        stageRequest(
+          ec2Target(environmentId, { maxLifetimeSeconds: 0, bootstrapTimeoutSeconds: 0 }),
+        ),
+      );
+      await registry.putWorker({
+        workerId,
+        kind: 'EC2',
+        environmentId,
+        revisionId: 'r-1',
+        state: 'IDLE',
+        instanceId: workerId,
+        createdAtMs: now,
+        maxLifetimeSeconds: 0,
+        bootstrapTimeoutSeconds: 0,
+      });
+
+      now += 200_000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.silent).toEqual([]);
+      expect(await registry.getWorker(workerId)).not.toBeNull();
+    });
+
+    it('never calls an AgentCore session silent — its row is not a poll loop', async () => {
+      // An AgentCore row never heartbeats by design. Judging it on silence would
+      // StopRuntimeSession a session that is mid-stage.
+      const environmentId = nextEnv();
+      let now = 1_000_000;
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        workerSilentMs: 300_000,
+      });
+      const sessionId = 'aidlc-intent-quiet';
+      await scheduler.enqueueStage(stageRequest(agentcoreTarget(environmentId), { sessionId }));
+
+      now += 3_600_000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.silent).toEqual([]);
+      expect(await registry.getWorker(sessionId)).not.toBeNull();
+      expect(provisioners.agentcoreStub.terminate).not.toHaveBeenCalled();
+    });
+
     it('releases a worker past its lifetime cap', async () => {
       const environmentId = nextEnv();
       let now = 1_000_000;
