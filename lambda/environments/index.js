@@ -26,7 +26,7 @@ import {
   responseError,
 } from './request.js';
 import { createEnvironmentStore } from './store.js';
-import { evaluateImage, imageAssertions } from './ec2-launch-spec.js';
+import { evaluateImage, imageAssertions, validateEc2LaunchSpec } from './ec2-launch-spec.js';
 import { createLaunchTemplateForRevision } from './ec2-launch-template.js';
 import { createToolStore } from './tool-store.js';
 
@@ -148,6 +148,62 @@ const launchTemplatePlatform = () => ({
   bedrockModel: process.env.BEDROCK_MODEL,
   runtimeCompatibilityVersion: process.env.RUNTIME_COMPATIBILITY_VERSION,
 });
+
+/**
+ * Make an EC2 revision usable.
+ *
+ * There is no build. The AMI is built outside this system and the operator gives
+ * us its id, so all the platform does is check the image is actually usable and
+ * create the launch template `CreateFleet` needs. The template is per revision so
+ * a published revision's launch identity is frozen — republishing an environment
+ * must not move where a running intent places its stages.
+ *
+ * On success the revision is READY (publishable). On an unusable AMI it is FAILED
+ * with the specific reasons, because a wrong architecture or a deregistered image
+ * is the operator's most likely mistake and should say so here rather than at
+ * first placement.
+ */
+const readyEc2Revision = async ({ store, environment, revision, deps }) => {
+  const spec = revision.launchSpec;
+  const platform = launchTemplatePlatform();
+  if (!platform.instanceProfileArn || !platform.securityGroupId || !platform.valkeyHost) {
+    throw Object.assign(new Error('EC2 environments are not configured in this deployment'), {
+      statusCode: 503,
+      code: 'EC2_NOT_CONFIGURED',
+    });
+  }
+
+  const assertions = imageAssertions(spec);
+  const described = await deps.ec2
+    .send(
+      new deps.DescribeImagesCommand({
+        ImageIds: [assertions.imageId],
+        ...(assertions.owners ? { Owners: assertions.owners } : {}),
+      }),
+    )
+    .catch(() => ({ Images: [] }));
+  const verdict = evaluateImage(spec, described.Images?.[0] ?? null);
+  if (!verdict.valid) {
+    return store.updateRevision(environment.environmentId, revision.revisionId, {
+      status: 'FAILED',
+      failure: { code: 'IMAGE_UNUSABLE', errors: verdict.errors },
+    });
+  }
+
+  const launch = await createLaunchTemplateForRevision({
+    ec2: deps.ec2,
+    spec,
+    environmentId: environment.environmentId,
+    revisionId: revision.revisionId,
+    platform,
+  });
+  return store.updateRevision(environment.environmentId, revision.revisionId, {
+    status: 'READY',
+    launchTemplateId: launch.launchTemplateId,
+    launchTemplateVersion: launch.launchTemplateVersion,
+    failure: null,
+  });
+};
 
 const startBuild = async ({ store, environment, revision, actor, deps }) => {
   if (revision.status !== 'DRAFT') {
@@ -391,6 +447,29 @@ export const createHandler = ({
         const id = normalizeEnvironmentId(data.environmentId || data.name);
         if (id === 'rebuild') {
           return response(400, { error: 'environmentId is reserved by the platform' });
+        }
+        // An EC2 environment is an AMI plus a machine shape. No recipe, no base
+        // environment to inherit tools from, and nothing to build.
+        if (String(data.kind ?? 'AGENTCORE').toUpperCase() === 'EC2') {
+          const validated = validateEc2LaunchSpec(data.launchSpec ?? data);
+          if (!validated.valid) {
+            return response(400, { error: 'Invalid launch spec', errors: validated.errors });
+          }
+          const createdEc2 = await store.createEnvironment({
+            environmentId: id,
+            name: data.name.trim(),
+            description: String(data.description ?? '').trim(),
+            kind: 'EC2',
+            launchSpec: validated.spec,
+            createdBy: actor,
+          });
+          const readied = await readyEc2Revision({
+            store,
+            environment: createdEc2.environment,
+            revision: createdEc2.revision,
+            deps,
+          });
+          return response(201, { ...createdEc2, revision: readied });
         }
         const baseEnvironmentId = data.baseEnvironmentId || 'standard';
         await assertAcyclicBase(store, id, baseEnvironmentId);

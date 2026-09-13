@@ -46,12 +46,15 @@ chmod 0644 /etc/profile.d/aidlc-toolchain.sh
 # Read from the Dockerfile so a worker and the container run the same runtime.
 NODE_VERSION=$(grep -oE 'node:[0-9]+\.[0-9]+\.[0-9]+' "$DOCKERFILE" | head -1 | cut -d: -f2)
 ARCH=$([ "$(uname -m)" = "aarch64" ] && echo arm64 || echo x64)
-curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz"
+# The tarball must keep its published NAME: `sha256sum -c` resolves the filename
+# listed in SHASUMS256.txt relative to the cwd, so renaming it fails the check.
+NODE_TARBALL="node-v${NODE_VERSION}-linux-${ARCH}.tar.xz"
+curl -fsSLo "/tmp/${NODE_TARBALL}" "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}"
 curl -fsSLo /tmp/SHASUMS256.txt "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"
-(cd /tmp && grep " node-v${NODE_VERSION}-linux-${ARCH}.tar.xz\$" SHASUMS256.txt | sha256sum -c -)
+(cd /tmp && grep " ${NODE_TARBALL}\$" SHASUMS256.txt | sha256sum -c -)
 install -d "${RUNNER_ROOT}/node"
-tar -xJf /tmp/node.tar.xz -C "${RUNNER_ROOT}/node" --strip-components=1
-rm -f /tmp/node.tar.xz /tmp/SHASUMS256.txt
+tar -xJf "/tmp/${NODE_TARBALL}" -C "${RUNNER_ROOT}/node" --strip-components=1
+rm -f "/tmp/${NODE_TARBALL}" /tmp/SHASUMS256.txt
 export PATH="${RUNNER_ROOT}/node/bin:${PATH}"
 node --version | grep -qF "v${NODE_VERSION}"
 
