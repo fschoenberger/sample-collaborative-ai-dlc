@@ -14,6 +14,10 @@
 # Usage: provision-worker-ami.sh [repo-dir]
 set -euxo pipefail
 
+# cloud-init runs user-data with no HOME, and several third-party installers
+# (npm, kiro) dereference it unconditionally. Set it before anything else.
+export HOME=${HOME:-/root}
+
 REPO=${1:-/opt/aidlc-dev}
 RUNNER_ROOT=/opt/aidlc-runner
 DOCKERFILE="${REPO}/lambda/agentcore/Dockerfile"
@@ -82,14 +86,23 @@ ln -sf /opt/opencode/bin/opencode /usr/local/bin/opencode
 rm -f /tmp/opencode.tar.gz
 opencode --version | grep -qF "${OPENCODE_VERSION}"
 
+# Kiro is best-effort. Its installer is the most fragile of the four (it needs
+# HOME, does its own setup dance) and it authenticates with a separate Kiro API
+# key, so a worker without it still runs every Bedrock-backed CLI. A failure here
+# must not cost the whole AMI.
 KIRO_ARCH=$([ "$ARCH" = "x64" ] && echo x86_64 || echo aarch64)
-curl -fsSLo /tmp/kiro.zip \
-  "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-${KIRO_ARCH}-linux-musl.zip"
-unzip -q /tmp/kiro.zip -d /tmp/kiro-cli
-KIRO_CLI_SKIP_SETUP=1 /tmp/kiro-cli/kirocli/install.sh
-install -d /opt/kiro
-cp -a /root/.local/bin /opt/kiro/bin
-ln -sf /opt/kiro/bin/kiro-cli /usr/local/bin/kiro-cli
+KIRO_OK=no
+if curl -fsSLo /tmp/kiro.zip \
+     "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-${KIRO_ARCH}-linux-musl.zip" \
+   && unzip -q /tmp/kiro.zip -d /tmp/kiro-cli \
+   && KIRO_CLI_SKIP_SETUP=1 HOME=/root /tmp/kiro-cli/kirocli/install.sh; then
+  install -d /opt/kiro
+  cp -a /root/.local/bin /opt/kiro/bin
+  ln -sf /opt/kiro/bin/kiro-cli /usr/local/bin/kiro-cli
+  KIRO_OK=yes
+else
+  echo "[ami] WARNING: kiro-cli install failed; continuing without it"
+fi
 rm -rf /tmp/kiro.zip /tmp/kiro-cli /root/.local
 
 # Bun, for the deterministic CODE sensors (they shell out to bunx eslint / tsc).
@@ -163,7 +176,7 @@ cat > /etc/aidlc-worker-ami.json <<PROVENANCE
   "claudeCode": "${CLAUDE_CODE_VERSION}",
   "codex": "${CODEX_VERSION}",
   "opencode": "${OPENCODE_VERSION}",
-  "kiroCli": "${KIRO_CLI_VERSION}",
+  "kiroCli": "$([ "$KIRO_OK" = yes ] && echo "${KIRO_CLI_VERSION}" || echo "not-installed")",
   "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 PROVENANCE

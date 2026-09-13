@@ -610,6 +610,21 @@ module "managed_environments" {
   environment_repository_arn    = module.agentcore.managed_environment_repository_arn
   cors_allowed_origins          = local.cors_allowed_origins
 
+  # EC2 environments: the ingredients a per-revision launch template must carry.
+  executor_instance_profile_arn = module.ec2_executors.instance_profile_arn
+  executor_security_group_id    = module.scheduler.client_security_group_id
+  valkey_host                   = module.scheduler.valkey_host
+  valkey_port                   = tostring(module.scheduler.valkey_port)
+  scheduler_function_name       = module.scheduler.function_name
+  v2_process_table_name         = module.agentcore.v2_executions_table_name
+  blocks_table_name             = module.dynamodb.blocks_table_name
+  artifacts_bucket_name         = module.s3.artifacts_bucket_name
+  neptune_endpoint              = module.neptune.cluster_endpoint
+  connections_table_name        = module.dynamodb.connections_table_name
+  websocket_endpoint            = replace(module.realtime.websocket_api_endpoint, "wss://", "https://")
+  aidlc_repo_ref                = var.aidlc_repo_ref
+  bedrock_model                 = var.bedrock_model
+
   tags = {
     Environment = var.environment
     Project     = var.project_name

@@ -103,3 +103,88 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+# ── EC2 environment ingredients ─────────────────────────────────────────────
+# An EC2 environment has nothing to build: the operator brings the AMI. What this
+# lambda does need is everything a per-revision launch template must carry, so a
+# worker booted from that template can find its queue and do its job. Empty
+# defaults mean "EC2 environments are not configured here", and the API says so
+# rather than creating a template that cannot work.
+
+variable "executor_instance_profile_arn" {
+  description = "Instance profile attached to workers by the per-revision launch template"
+  type        = string
+  default     = ""
+}
+
+variable "executor_security_group_id" {
+  description = "Platform security group every worker gets, before any operator ones"
+  type        = string
+  default     = ""
+}
+
+variable "valkey_host" {
+  description = "Valkey endpoint a worker connects to for its job queue"
+  type        = string
+  default     = ""
+}
+
+variable "valkey_port" {
+  description = "Valkey endpoint port"
+  type        = string
+  default     = "6379"
+}
+
+variable "scheduler_function_name" {
+  description = "Scheduler function a worker calls for issue-grant at claim time"
+  type        = string
+  default     = ""
+}
+
+variable "v2_process_table_name" {
+  description = "v2 process/state table a worker reads and writes"
+  type        = string
+  default     = ""
+}
+
+variable "artifacts_bucket_name" {
+  description = "Artifacts bucket (block bodies, methodology snapshot)"
+  type        = string
+  default     = ""
+}
+
+variable "neptune_endpoint" {
+  description = "Neptune endpoint for the graph"
+  type        = string
+  default     = ""
+}
+
+variable "connections_table_name" {
+  description = "Websocket connections table for live output"
+  type        = string
+  default     = ""
+}
+
+variable "websocket_endpoint" {
+  description = "Websocket management endpoint"
+  type        = string
+  default     = ""
+}
+
+variable "blocks_table_name" {
+  description = "Blocks table (read)"
+  type        = string
+  default     = ""
+}
+
+variable "aidlc_repo_ref" {
+  description = "Pinned upstream methodology ref"
+  type        = string
+  default     = ""
+}
+
+variable "bedrock_model" {
+  description = "Default model id"
+  type        = string
+  default     = ""
+}

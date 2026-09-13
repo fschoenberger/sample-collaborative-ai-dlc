@@ -285,6 +285,40 @@ resource "aws_iam_role_policy_attachment" "control_basic" {
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+resource "aws_iam_role_policy" "control_ec2" {
+  name = "environment-control-ec2"
+  role = aws_iam_role.control.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Validate the operator's AMI before accepting it, so a wrong
+        # architecture or a deregistered image fails on save with a message that
+        # names it rather than at first placement.
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeImages"]
+        Resource = "*"
+      },
+      {
+        # The per-revision launch template: this revision's frozen launch identity.
+        Effect   = "Allow"
+        Action   = ["ec2:CreateLaunchTemplate", "ec2:CreateLaunchTemplateVersion", "ec2:CreateTags", "ec2:DescribeLaunchTemplates"]
+        Resource = "*"
+      },
+      {
+        # CreateLaunchTemplate embeds the worker instance profile.
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ec2.${local.dns_suffix}" }
+        }
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "control" {
   name = "managed-environment-control"
   role = aws_iam_role.control.id
@@ -360,6 +394,26 @@ module "control_lambda" {
     RUNTIME_COMPATIBILITY_VERSION   = var.runtime_compatibility_version
     MAX_ENVIRONMENT_IMAGE_MB        = "2048"
     CORS_ALLOWED_ORIGINS            = var.cors_allowed_origins
+
+    # EC2 environments: what a per-revision launch template must carry.
+    PROJECT_NAME                  = var.project_name
+    ENVIRONMENT                   = var.environment
+    EXECUTOR_INSTANCE_PROFILE_ARN = var.executor_instance_profile_arn
+    EXECUTOR_SECURITY_GROUP_ID    = var.executor_security_group_id
+    VALKEY_HOST                   = var.valkey_host
+    VALKEY_PORT                   = var.valkey_port
+    SCHEDULER_FUNCTION            = var.scheduler_function_name
+    V2_PROCESS_TABLE              = var.v2_process_table_name
+    BLOCKS_TABLE                  = var.blocks_table_name
+    ARTIFACTS_BUCKET              = var.artifacts_bucket_name
+    NEPTUNE_ENDPOINT              = var.neptune_endpoint
+    CONNECTIONS_TABLE             = var.connections_table_name
+    WEBSOCKET_ENDPOINT            = var.websocket_endpoint
+    CREDENTIAL_BROKER_FUNCTION    = "${var.project_name}-credential-broker-${var.environment}"
+    SOURCE_CONTROL_FUNCTION       = "${var.project_name}-source-control-${var.environment}"
+    MCP_SECRETS_SSM_PREFIX        = "/${var.project_name}/${var.environment}"
+    AIDLC_REPO_REF                = var.aidlc_repo_ref
+    BEDROCK_MODEL                 = var.bedrock_model
   }
 }
 
