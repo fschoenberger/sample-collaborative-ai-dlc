@@ -207,8 +207,8 @@ resource "aws_iam_role_policy" "scheduler" {
       {
         # The wake provisioner. No model permissions: agent auth is token-based
         # through the credential broker, exactly as for the runtime itself.
-        Effect   = "Allow"
-        Action   = ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"]
+        Effect = "Allow"
+        Action = ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"]
         Resource = [
           var.agentcore_runtime_arn,
           "${var.agentcore_runtime_arn}/*",

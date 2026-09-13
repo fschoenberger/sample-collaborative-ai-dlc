@@ -191,6 +191,15 @@ resource "terraform_data" "domain_preconditions" {
 # Certificate first, then the distribution that references it, then the alias
 # records that point at the distribution. Splitting the certificate and the
 # records into different graph positions is what avoids a dependency cycle.
+data "aws_availability_zones" "available" {
+  state = "available"
+
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
+}
+
 module "domain" {
   source = "./modules/domain"
 
@@ -600,6 +609,57 @@ module "managed_environments" {
   environment_repository_url    = module.agentcore.managed_environment_repository_url
   environment_repository_arn    = module.agentcore.managed_environment_repository_arn
   cors_allowed_origins          = local.cors_allowed_origins
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# Worker ingredients: the instance role and profile every per-revision launch
+# template attaches. No launch template here — that is created per revision from
+# the operator's spec, so a published revision has a frozen launch identity.
+module "ec2_executors" {
+  source = "./modules/compute/ec2-executors"
+
+  project_name                = var.project_name
+  environment                 = var.environment
+  neptune_cluster_resource_id = module.neptune.cluster_resource_id
+  v2_executions_table_arn     = module.agentcore.v2_executions_table_arn
+  blocks_table_arn            = module.dynamodb.blocks_table_arn
+  connections_table_arn       = module.dynamodb.connections_table_arn
+  artifacts_bucket_arn        = module.s3.artifacts_bucket_arn
+  websocket_execution_arn     = module.realtime.websocket_execution_arn
+
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
+
+# The placement scheduler and its Valkey registry. Stage dispatch for BOTH worker
+# kinds goes through here; the orchestrator invokes it rather than speaking Valkey
+# itself, because it is not VPC-attached and ElastiCache has no public endpoint.
+module "scheduler" {
+  source = "./modules/compute/scheduler"
+
+  project_name = var.project_name
+  environment  = var.environment
+
+  vpc_id                  = module.networking.vpc_id
+  vpc_cidr                = module.networking.vpc_cidr_block
+  private_route_table_ids = module.networking.private_route_table_ids
+  availability_zones      = data.aws_availability_zones.available.names
+
+  environment_registry_table_name = module.dynamodb.environment_registry_table_name
+  environment_registry_table_arn  = module.dynamodb.environment_registry_table_arn
+  v2_executions_table_arn         = module.agentcore.v2_executions_table_arn
+
+  agent_credential_grant_secret_param_name = aws_ssm_parameter.agent_credential_grant_secret.name
+  agentcore_runtime_arn                    = module.agentcore.runtime_arn
+
+  executor_instance_profile_arn = module.ec2_executors.instance_profile_arn
+  executor_role_arn             = module.ec2_executors.role_arn
 
   tags = {
     Environment = var.environment

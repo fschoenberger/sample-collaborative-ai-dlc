@@ -9,9 +9,11 @@
 # launch identity so republishing cannot move a running intent's placement.
 #
 # What Terraform owns is what every worker shares regardless of environment: the
-# instance role and profile, the runner-bundle bucket, and the values the
-# templates reference. Those are passed to the environments lambda as env vars,
-# the same way MANAGED_RUNTIME_ROLE_ARN and MANAGED_RUNTIME_SUBNETS already are.
+# instance role and profile, and the values the templates reference. The worker
+# runtime itself is baked into the AMI by scripts/provision-worker-ami.sh, so
+# there is nothing to ship at boot and no bundle bucket. These values are passed
+# to the environments lambda as env vars, the same way MANAGED_RUNTIME_ROLE_ARN
+# and MANAGED_RUNTIME_SUBNETS already are.
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -32,80 +34,13 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# The runner bundle bucket. A versioned, digest-pinned tarball per
-# (platform, architecture) that instance user-data fetches at boot. This is how
-# an operator's AMI stays genuinely opaque: nothing of ours is baked into it.
-# ---------------------------------------------------------------------------
-
-resource "random_id" "bundle_suffix" {
-  byte_length = 4
-}
-
-resource "aws_s3_bucket" "runner_bundles" {
-  bucket        = "${var.project_name}-runner-bundles-${var.environment}-${random_id.bundle_suffix.hex}"
-  force_destroy = var.environment != "prod"
-  tags          = var.tags
-}
-
-resource "aws_s3_bucket_versioning" "runner_bundles" {
-  bucket = aws_s3_bucket.runner_bundles.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "runner_bundles" {
-  bucket                  = aws_s3_bucket.runner_bundles.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "runner_bundles" {
-  bucket = aws_s3_bucket.runner_bundles.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-data "aws_iam_policy_document" "runner_bundles" {
-  statement {
-    sid     = "DenyInsecureTransport"
-    effect  = "Deny"
-    actions = ["s3:*"]
-    resources = [
-      aws_s3_bucket.runner_bundles.arn,
-      "${aws_s3_bucket.runner_bundles.arn}/*",
-    ]
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-    condition {
-      test     = "Bool"
-      variable = "aws:SecureTransport"
-      values   = ["false"]
-    }
-  }
-}
-
-resource "aws_s3_bucket_policy" "runner_bundles" {
-  bucket = aws_s3_bucket.runner_bundles.id
-  policy = data.aws_iam_policy_document.runner_bundles.json
-}
-
-# ---------------------------------------------------------------------------
 # The worker instance role.
 #
 # Mirrors the AgentCore runtime role (terraform/modules/compute/agentcore),
 # because a worker runs the SAME container commands and therefore needs the same
 # access: Neptune, the process table, artifacts, MCP secrets, the credential
 # broker, the websocket, and the durable callback API. Differences:
-#   - no ECR image pull (the bundle comes from S3, not a container registry);
-#   + runner-bundle read;
+#   - no ECR image pull (the runtime is in the AMI, not a container registry);
 #   + scheduler invoke, for issue-grant at claim time.
 # Deliberately NO model-invocation permissions: agent auth is token-based through
 # the broker, and that must stay the only path on a worker too.
@@ -147,12 +82,6 @@ resource "aws_iam_role_policy" "executor" {
     Version = "2012-10-17"
     Statement = concat(
       [
-        {
-          # The runner bundle, verified by digest before it is executed.
-          Effect   = "Allow"
-          Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"]
-          Resource = [aws_s3_bucket.runner_bundles.arn, "${aws_s3_bucket.runner_bundles.arn}/*"]
-        },
         {
           # Git and agent credentials just-in-time; provider operations through
           # the token-owning service. Same as the AgentCore runtime.

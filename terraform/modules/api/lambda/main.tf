@@ -24,6 +24,9 @@ locals {
   neptune_resource_arn = "arn:${local.partition}:neptune-db:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.neptune_cluster_resource_id}/*"
 
   # Both forms are needed because durable invocations target the `live` alias.
+  scheduler_function_name = "${var.project_name}-scheduler-${var.environment}"
+  scheduler_function_arn  = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-scheduler-${var.environment}"
+
   v2_orchestrator_function_arns = [
     "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-v2-orchestrator-${var.environment}",
     "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-v2-orchestrator-${var.environment}:*",
@@ -2639,6 +2642,21 @@ resource "aws_iam_role_policy_attachment" "v2_orchestrator_basic" {
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+resource "aws_iam_role_policy" "v2_orchestrator_scheduler" {
+  name = "v2-orchestrator-scheduler"
+  role = aws_iam_role.v2_orchestrator.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      # Stage placement for both worker kinds.
+      Effect   = "Allow"
+      Action   = ["lambda:InvokeFunction"]
+      Resource = local.scheduler_function_arn
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "v2_orchestrator" {
   name = "v2-orchestrator"
   role = aws_iam_role.v2_orchestrator.id
@@ -2749,6 +2767,10 @@ module "v2_orchestrator_lambda" {
     WEBSOCKET_ENDPOINT                   = var.websocket_api_endpoint_https
     DURABLE_EXECUTION_TIMEOUT_SECONDS    = "31622400"
     DURABLE_GATE_DEADLINE_MARGIN_SECONDS = "300"
+    # Stage placement. Named by convention rather than passed in, because the
+    # scheduler module depends on outputs of this one and passing it back would
+    # be a cycle — the same reason the orchestrator ARNs above are constructed.
+    SCHEDULER_FUNCTION = local.scheduler_function_name
   }
 
   cloudwatch_logs_retention_in_days = var.environment == "prod" ? 30 : 7
