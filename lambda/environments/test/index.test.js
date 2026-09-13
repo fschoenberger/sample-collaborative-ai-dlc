@@ -797,6 +797,41 @@ describe('managed environment handler', () => {
       expect(JSON.parse(response.body).revision).toMatchObject({ status: 'READY' });
     });
 
+    it('merges a partial edit onto the CURRENT REVISION spec, not the environment row', async () => {
+      // launchSpec lives on the revision. "Same machine shape, new AMI" is the
+      // common edit, and merging onto the environment row would validate a spec
+      // missing every field the caller did not resend.
+      ec2Configured();
+      const environment = {
+        environmentId: 'cpp-buildhost',
+        kind: 'EC2',
+        status: 'PUBLISHED',
+        currentRevisionId: 'r-1',
+      };
+      const store = ec2Store(environment, { revisionId: 'r-1', kind: 'EC2', launchSpec: EC2_SPEC });
+      const handler = createHandler({ store, ec2Client: ec2Client() });
+
+      const response = await handler({
+        httpMethod: 'PUT',
+        path: '/environments/cpp-buildhost',
+        body: JSON.stringify({ imageRef: 'ami-0bbbbbbbbbbbbbbbb' }),
+        ...claims('platform-admin'),
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(store.createRevision).toHaveBeenCalledWith(
+        expect.objectContaining({
+          launchSpec: expect.objectContaining({
+            imageRef: 'ami-0bbbbbbbbbbbbbbbb',
+            // Carried over from the current revision, not resent by the caller.
+            instanceTypes: ['c7i.2xlarge'],
+            architecture: 'x86_64',
+            maxLifetimeSeconds: 7200,
+          }),
+        }),
+      );
+    });
+
     it('never runs the tool-recipe path for an EC2 environment', async () => {
       // Falling through stored launchSpec: undefined and left a corrupt DRAFT as
       // currentRevisionId.

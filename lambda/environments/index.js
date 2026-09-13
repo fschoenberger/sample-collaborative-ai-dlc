@@ -594,9 +594,18 @@ export const createHandler = ({
         if ((environment.kind ?? 'AGENTCORE') === 'EC2') {
           assertEc2Configured();
           const ec2Data = parseBody(event);
-          const validated = validateEc2LaunchSpec(
-            ec2Data.launchSpec ?? { ...environment.launchSpec, ...ec2Data },
-          );
+          // The spec lives on the REVISION, not the environment row, so a partial
+          // edit — the common case, "same machine shape, new AMI" — has to merge
+          // onto the current revision's spec. Reading it off `environment` would
+          // silently merge onto undefined and validate a spec missing every field
+          // the caller did not resend.
+          const currentEc2Revision = environment.currentRevisionId
+            ? await store.getRevision(environmentId, environment.currentRevisionId)
+            : null;
+          const validated = validateEc2LaunchSpec({
+            ...(currentEc2Revision?.launchSpec ?? {}),
+            ...(ec2Data.launchSpec ?? ec2Data),
+          });
           if (!validated.valid) {
             return response(400, { error: 'Invalid launch spec', errors: validated.errors });
           }
