@@ -14,6 +14,7 @@ const setupFiles = [fileURLToPath(new URL('./test/setup.js', import.meta.url))];
 const globalSetup = [
   fileURLToPath(new URL('./test/gremlin-setup.js', import.meta.url)),
   fileURLToPath(new URL('./test/dynamodb-setup.js', import.meta.url)),
+  fileURLToPath(new URL('./test/valkey-setup.js', import.meta.url)),
 ];
 
 export default defineConfig({
