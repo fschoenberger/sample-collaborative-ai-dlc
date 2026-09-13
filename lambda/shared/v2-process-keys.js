@@ -365,6 +365,17 @@ const buildExecutionMeta = ({
   // Immutable environment identity, image, runtime, endpoint, compatibility,
   // and verification data used for the full intent lifetime.
   environment = null,
+  // Per-stage placement: { [stageId]: <environment snapshot> }, resolved and
+  // snapshotted at create so republishing an environment cannot move where a
+  // running intent puts its stages. resolveStageTarget reads this back at
+  // dispatch and falls through to `environment` for any stage not listed.
+  //
+  // This function is an explicit allow-list — a field absent from the
+  // destructuring is silently dropped, no matter that the caller passed it. That
+  // is exactly what happened here: the intents lambda resolved all 32 bindings,
+  // snapshotted them, handed them to createExecution, and they vanished, so every
+  // stage of an EC2-bound run executed on the AgentCore default instead.
+  stageEnvironments = null,
   // Derive-time graph enrichment mode ('off'|'llm') snapshotted from the Admin
   // SSM setting at create; the orchestrator forwards it in the derive-artifacts
   // payload. Snapshotting keeps a run's behaviour stable even if the Admin
@@ -475,6 +486,7 @@ const buildExecutionMeta = ({
   customMcpServers,
   customRules,
   environment,
+  stageEnvironments,
   deriveEnrichment,
   parkReleaseSeconds,
   maxParallelUnits,

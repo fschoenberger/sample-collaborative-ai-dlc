@@ -47,6 +47,7 @@ import {
   TRACKER_SYNC_STATES,
 } from '../v2-process-keys.js';
 import { createProcessStore } from '../v2-process-store.js';
+import { EC2_KIND, resolveStageTarget } from '../runtime-target.js';
 
 describe('v2-process-keys', () => {
   it('namespaces every record under EXEC#<id>', () => {
@@ -168,6 +169,64 @@ describe('createProcessStore', () => {
     const call = ddb.commandCalls(PutCommand)[0].args[0].input;
     expect(call.Item.sk).toBe('META');
     expect(call.ConditionExpression).toContain('attribute_not_exists(pk)');
+  });
+
+  // The placement a caller hands createExecution is the placement dispatch uses.
+  // buildExecutionMeta destructures an explicit allow-list, so a field the caller
+  // passes but the list omits is dropped without a word — which is how per-stage
+  // EC2 placement silently no-opped: the resolved snapshots never reached META and
+  // every stage fell through to the intent default. Asserting the row that lands
+  // in DynamoDB, then reading it back through resolveStageTarget, pins the whole
+  // path instead of the destructuring.
+  it('a per-stage environment binding handed to createExecution reaches stage dispatch', async () => {
+    ddb.on(PutCommand).resolves({});
+    const ec2 = {
+      environmentId: 'cpp-buildhost',
+      kind: 'EC2',
+      revisionId: 'r-2',
+      launchTemplateId: 'lt-0abc',
+      launchTemplateVersion: '3',
+      launchSpec: { architecture: 'x86_64', instanceTypes: ['c7i.2xlarge'] },
+    };
+    const agentcore = {
+      environmentId: 'standard',
+      kind: 'AGENTCORE',
+      revisionId: 'r-1',
+      runtimeArn: 'arn:aws:bedrock-agentcore:eu-central-1:1:runtime/std',
+      runtimeEndpoint: 'live',
+    };
+    await store.createExecution({
+      executionId: 'e1',
+      projectId: 'p1',
+      intentId: 'i1',
+      status: 'DRAFT',
+      workflowId: 'w',
+      workflowVersion: 1,
+      environment: agentcore,
+      stageEnvironments: { 'construction-code': ec2 },
+    });
+    const { Item } = ddb.commandCalls(PutCommand)[0].args[0].input;
+    expect(Item.environment).toEqual(agentcore);
+    expect(Item.stageEnvironments).toEqual({ 'construction-code': ec2 });
+    expect(resolveStageTarget(Item, 'construction-code')).toMatchObject({
+      kind: EC2_KIND,
+      environmentId: 'cpp-buildhost',
+      launchTemplateId: 'lt-0abc',
+    });
+    // An unbound stage still falls through to the intent default.
+    expect(resolveStageTarget(Item, 'inception-requirements')).toMatchObject({
+      environmentId: 'standard',
+    });
+    // And an intent that binds no stage at all stores an explicit null, so
+    // dispatch has nothing to read back and every stage takes the default.
+    await store.createExecution({
+      executionId: 'e2',
+      projectId: 'p1',
+      intentId: 'i2',
+      workflowId: 'w',
+      workflowVersion: 1,
+    });
+    expect(ddb.commandCalls(PutCommand)[1].args[0].input.Item.stageEnvironments).toBeNull();
   });
 
   it('opts into strongly consistent META reads only when requested', async () => {
