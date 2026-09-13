@@ -603,7 +603,7 @@ export const createHandler = ({
             ? await store.getRevision(environmentId, environment.currentRevisionId)
             : null;
           const validated = validateEc2LaunchSpec({
-            ...(currentEc2Revision?.launchSpec ?? {}),
+            ...currentEc2Revision?.launchSpec,
             ...(ec2Data.launchSpec ?? ec2Data),
           });
           if (!validated.valid) {
