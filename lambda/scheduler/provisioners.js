@@ -17,12 +17,28 @@
 // the reconcile sweep are all consequences of ownership, and none of them has an
 // AgentCore meaning.
 
+import { createHash } from 'node:crypto';
 import { EC2Client, CreateFleetCommand, TerminateInstancesCommand } from '@aws-sdk/client-ec2';
 
 // Tag every instance we create so the reconciler can rebuild its inventory from
 // EC2 rather than trusting Valkey. This is the mechanism that makes Valkey
 // disposable, so the tags are not decoration.
 export const MANAGED_TAG = 'aidlc:scheduler';
+
+/**
+ * The CreateFleet idempotency token: a HASH of the worker id, never a truncation
+ * of it.
+ *
+ * EC2 caps a client token at 64 characters. `worker-${workerId}` blew that,
+ * because the caller's id already carries an executionId plus a stageInstanceId.
+ * Truncating to fit would be worse than the error it replaces: two stages whose
+ * ids share a prefix would submit the SAME token, and CreateFleet would dedupe
+ * and hand both of them the same instance. Hashing is fixed-length and keeps the
+ * property the token exists for — a retried provision for one worker must not
+ * produce a second instance.
+ */
+export const clientTokenFor = (workerId) =>
+  `worker-${createHash('sha256').update(String(workerId)).digest('hex').slice(0, 40)}`;
 
 const fleetTags = ({
   projectName,
@@ -177,7 +193,7 @@ export const createEc2Provisioner = ({ client = new EC2Client({}), env = process
       ],
       // Our own idempotency: a retried provision for the same worker must not
       // produce a second instance.
-      ClientToken: `worker-${workerId}`,
+      ClientToken: clientTokenFor(workerId),
     });
     const result = await client.send(command);
     const instanceId = result.Instances?.[0]?.InstanceIds?.[0] ?? null;
