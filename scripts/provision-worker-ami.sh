@@ -32,12 +32,24 @@ dnf -y install --setopt=install_weak_deps=False \
   gcc-c++ libstdc++-devel \
   perl-core zip pkgconf-pkg-config
 
-# vcpkg. Pinned to a tag so an AMI rebuild is reproducible; VCPKG_ROOT is exported
-# system-wide so a stage's own build scripts find it without being told.
-VCPKG_REF=${VCPKG_REF:-2026.08.15}
+# vcpkg. Pinned to a release tag so an AMI rebuild is reproducible; VCPKG_ROOT is
+# exported system-wide so a stage's own build scripts find it without being told.
+#
+# NO FALLBACK. This used to be `clone --branch "$REF" || clone` with a default of
+# 2026.08.15 — a tag that does not exist upstream — so every build silently took
+# the fallback and shipped whatever the default branch happened to be that day.
+# The image was fine and the comment above it was a lie: two AMIs built a day apart
+# carried different vcpkg trees. An unresolvable ref is now a build failure, which
+# is the only way a pin means anything.
+VCPKG_REF=${VCPKG_REF:-2026.07.29}
 if [ ! -d /opt/vcpkg ]; then
-  git clone --depth 1 --branch "${VCPKG_REF}" https://github.com/microsoft/vcpkg.git /opt/vcpkg \
-    || git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg
+  if ! git clone --depth 1 --branch "${VCPKG_REF}" https://github.com/microsoft/vcpkg.git /opt/vcpkg; then
+    echo "FATAL: vcpkg ref '${VCPKG_REF}' does not exist upstream." >&2
+    echo "       Pick a real tag from https://github.com/microsoft/vcpkg/tags" >&2
+    echo "       or override with VCPKG_REF=<tag>. Refusing to build an" >&2
+    echo "       unpinned image." >&2
+    exit 1
+  fi
   /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 fi
 cat > /etc/profile.d/aidlc-toolchain.sh <<'PROFILE'
