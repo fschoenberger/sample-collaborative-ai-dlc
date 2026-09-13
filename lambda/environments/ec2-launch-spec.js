@@ -472,9 +472,6 @@ export const validateEc2LaunchSpec = (input) => {
       errors,
     }),
     maxHourlyCostUsd: null,
-    runnerBundleVersion: input.runnerBundleVersion
-      ? String(input.runnerBundleVersion).trim()
-      : null,
     tags: {},
   };
 

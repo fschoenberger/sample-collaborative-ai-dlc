@@ -26,6 +26,8 @@ import {
   responseError,
 } from './request.js';
 import { createEnvironmentStore } from './store.js';
+import { evaluateImage, imageAssertions } from './ec2-launch-spec.js';
+import { createLaunchTemplateForRevision } from './ec2-launch-template.js';
 import { createToolStore } from './tool-store.js';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -120,10 +122,46 @@ const assertCatalogRevision = (environmentId, revision) => {
   }
 };
 
+// The launch-template ingredients Terraform hands this lambda, mirroring how
+// MANAGED_RUNTIME_ROLE_ARN and friends are already supplied for AgentCore
+// runtimes. Read lazily so a deployment without EC2 support configured still
+// serves every AgentCore path.
+const launchTemplatePlatform = () => ({
+  projectName: process.env.PROJECT_NAME ?? 'aidlc',
+  environment: process.env.ENVIRONMENT ?? 'dev',
+  region: process.env.AWS_REGION,
+  instanceProfileArn: process.env.EXECUTOR_INSTANCE_PROFILE_ARN,
+  securityGroupId: process.env.EXECUTOR_SECURITY_GROUP_ID,
+  valkeyHost: process.env.VALKEY_HOST,
+  valkeyPort: process.env.VALKEY_PORT ?? '6379',
+  schedulerFunction: process.env.SCHEDULER_FUNCTION,
+  processTable: process.env.V2_PROCESS_TABLE,
+  blocksTable: process.env.BLOCKS_TABLE,
+  artifactsBucket: process.env.ARTIFACTS_BUCKET,
+  neptuneEndpoint: process.env.NEPTUNE_ENDPOINT,
+  connectionsTable: process.env.CONNECTIONS_TABLE,
+  websocketEndpoint: process.env.WEBSOCKET_ENDPOINT,
+  credentialBrokerFunction: process.env.CREDENTIAL_BROKER_FUNCTION,
+  sourceControlFunction: process.env.SOURCE_CONTROL_FUNCTION,
+  mcpSecretsPrefix: process.env.MCP_SECRETS_SSM_PREFIX,
+  aidlcRepoRef: process.env.AIDLC_REPO_REF,
+  bedrockModel: process.env.BEDROCK_MODEL,
+  runtimeCompatibilityVersion: process.env.RUNTIME_COMPATIBILITY_VERSION,
+});
+
 const startBuild = async ({ store, environment, revision, actor, deps }) => {
   if (revision.status !== 'DRAFT') {
     throw Object.assign(new Error(`Revision is ${revision.status} and cannot be built`), {
       statusCode: 409,
+    });
+  }
+  if ((environment.kind ?? 'AGENTCORE') === 'EC2') {
+    // An EC2 environment has nothing to build. The AMI is built outside this
+    // system and the operator supplies its id; the only platform-side artifact is
+    // the launch template, created when the environment is saved.
+    throw Object.assign(new Error('EC2 environments are not built; they are published directly'), {
+      statusCode: 409,
+      code: 'EC2_HAS_NO_BUILD',
     });
   }
   const maxImageBytes = Number(process.env.MAX_ENVIRONMENT_IMAGE_MB || 2048) * 1024 * 1024;

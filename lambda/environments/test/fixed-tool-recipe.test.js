@@ -377,27 +377,29 @@ MANAGED_GO`,
     );
   });
 
-  it('runs EC2 revisions through the same statuses minus image scanning', () => {
+  it('gives EC2 revisions no build states at all', () => {
     const ec2 = { kind: 'EC2' };
-    // An EC2 revision has no container image, so there is nothing to scan:
-    // BUILDING (CreateLaunchTemplate) goes straight to VERIFYING.
-    expect(() => assertRevisionTransition('BUILDING', 'VERIFYING', ec2)).not.toThrow();
-    expect(() => assertRevisionTransition('VERIFYING', 'READY', ec2)).not.toThrow();
+    // The AMI is built outside this system; the operator supplies its id. So the
+    // lifecycle is only "is it usable" and "is it published".
+    expect(() => assertRevisionTransition('DRAFT', 'READY', ec2)).not.toThrow();
     expect(() => assertRevisionTransition('READY', 'PUBLISHED', ec2)).not.toThrow();
     expect(() => assertRevisionTransition('PUBLISHED', 'SUPERSEDED', ec2)).not.toThrow();
+    expect(() => assertRevisionTransition('DRAFT', 'FAILED', ec2)).not.toThrow();
+    expect(() => assertRevisionTransition('FAILED', 'READY', ec2)).not.toThrow();
 
-    // …and the scan states are unreachable rather than merely unused.
-    expect(() => assertRevisionTransition('BUILDING', 'SCANNING', ec2)).toThrow(
-      'Invalid EC2 revision status transition',
-    );
-    expect(() => assertRevisionTransition('SCANNING', 'VERIFYING', ec2)).toThrow(
-      'Invalid EC2 revision status transition',
-    );
-    // There is no security review to send a failed EC2 revision back to.
-    expect(() => assertRevisionTransition('FAILED', 'SECURITY_REVIEW', ec2)).toThrow(
-      'Invalid EC2 revision status transition',
-    );
-    expect(() => assertRevisionTransition('FAILED', 'QUEUED', ec2)).not.toThrow();
+    // Every build and scan state is unreachable, not merely unused.
+    for (const [from, to] of [
+      ['DRAFT', 'QUEUED'],
+      ['QUEUED', 'BUILDING'],
+      ['BUILDING', 'SCANNING'],
+      ['SCANNING', 'VERIFYING'],
+      ['VERIFYING', 'READY'],
+      ['FAILED', 'SECURITY_REVIEW'],
+    ]) {
+      expect(() => assertRevisionTransition(from, to, ec2)).toThrow(
+        'Invalid EC2 revision status transition',
+      );
+    }
   });
 
   it('defaults to the AGENTCORE lifecycle when no kind is supplied', () => {

@@ -22,8 +22,6 @@ const platform = (overrides = {}) => ({
   region: 'eu-central-1',
   instanceProfileArn: 'arn:aws:iam::1:instance-profile/executor',
   securityGroupId: 'sg-platform',
-  runnerBundleUri: 's3://bundles/runner-linux-x64.tar.gz',
-  runnerBundleSha256: 'a'.repeat(64),
   valkeyHost: 'cache.example',
   valkeyPort: 6379,
   schedulerFunction: 'collaborative-ai-dlc-scheduler-dev',
@@ -79,39 +77,22 @@ describe('renderUserData', () => {
       platform: platform(),
     });
 
-  it('verifies the bundle digest before extracting or executing it', () => {
+  it('fails loudly when the AMI has no runner installed', () => {
+    // The runner is baked in by provision-worker-ami.sh. If it is absent this AMI
+    // was never provisioned for AI-DLC, and an instance that keeps running would
+    // just sit there never claiming a job.
     const script = userData();
-    const verifyAt = script.indexOf('sha256sum -c -');
-    const extractAt = script.indexOf('tar -xzf');
-    const startAt = script.indexOf('systemctl enable --now');
-    expect(verifyAt).toBeGreaterThan(-1);
-    // Order is the security property: nothing from the bundle runs unverified.
-    expect(verifyAt).toBeLessThan(extractAt);
-    expect(extractAt).toBeLessThan(startAt);
+    expect(script).toContain('/opt/aidlc-runner/bin/aidlc-runner');
+    expect(script).toMatch(/FATAL.*not provisioned for AI-DLC/);
+    expect(script).toContain('exit 1');
   });
 
-  it('writes the environment file before starting the unit', () => {
+  it('downloads nothing at boot', () => {
+    // Everything is in the AMI, so a stage never waits on a fetch before starting.
     const script = userData();
-    expect(script.indexOf('/etc/aidlc-runner.env')).toBeLessThan(
-      script.indexOf('systemctl enable --now'),
-    );
-  });
-
-  it('installs the AWS CLI only when the AMI lacks it, assuming no package manager', () => {
-    const script = userData();
-    expect(script).toContain('if ! command -v aws >/dev/null 2>&1; then');
-    expect(script).toContain('awscli-exe-linux-x86_64.zip');
-    expect(script).not.toMatch(/\b(dnf|apt-get|yum) install/);
-  });
-
-  it('picks the aarch64 installer for an arm64 spec', () => {
-    const script = renderUserData({
-      spec: spec({ architecture: 'arm64', instanceTypes: ['c7g.2xlarge'] }),
-      environmentId: 'e',
-      revisionId: 'r',
-      platform: platform(),
-    });
-    expect(script).toContain('awscli-exe-linux-aarch64.zip');
+    expect(script).not.toMatch(/\bcurl\b/);
+    expect(script).not.toMatch(/aws s3 cp/);
+    expect(script).not.toMatch(/sha256sum/);
   });
 
   it('restricts the environment file, which carries endpoints and table names', () => {

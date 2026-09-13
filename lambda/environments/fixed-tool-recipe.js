@@ -638,24 +638,26 @@ const TRANSITIONS = {
   RETIRED: new Set(),
 };
 
-// An EC2 revision runs the SAME lifecycle with two states removed. There is no
-// container image, so there is nothing for ECR to scan: SCANNING and
-// SECURITY_REVIEW never occur and BUILDING (which for EC2 means
-// CreateLaunchTemplate) goes straight to VERIFYING (launch a probe instance, run
-// the capability checks, terminate). Keeping one status vocabulary means the
-// registry UI, the GSI1 status index and the status poller need no special cases
-// — only the legal edges differ.
+// An EC2 revision has NOTHING TO BUILD. The AMI is built outside this system and
+// the operator supplies its id, so there is no image, no ECR scan and no build
+// job — the only platform-side artifact is the launch template, created when the
+// environment is saved. The lifecycle is therefore just: is this AMI usable, and
+// is this revision the published one.
+//
+// The status vocabulary is shared with AGENTCORE so the registry UI, the GSI1
+// status index and the status poller need no special cases; the build states are
+// simply unreachable.
 const EC2_TRANSITIONS = {
-  DRAFT: new Set(['QUEUED', 'RETIRED']),
-  QUEUED: new Set(['BUILDING', 'FAILED']),
-  BUILDING: new Set(['VERIFYING', 'FAILED']),
+  DRAFT: new Set(['READY', 'FAILED', 'RETIRED']),
+  QUEUED: new Set(),
+  BUILDING: new Set(),
   SCANNING: new Set(),
   SECURITY_REVIEW: new Set(),
-  VERIFYING: new Set(['READY', 'FAILED']),
-  READY: new Set(['PUBLISHED', 'QUEUED', 'RETIRED']),
+  VERIFYING: new Set(),
+  READY: new Set(['PUBLISHED', 'FAILED', 'RETIRED']),
   PUBLISHED: new Set(['SUPERSEDED', 'RETIRED']),
   SUPERSEDED: new Set(['RETIRED']),
-  FAILED: new Set(['QUEUED', 'RETIRED']),
+  FAILED: new Set(['READY', 'RETIRED']),
   RETIRED: new Set(),
 };
 
