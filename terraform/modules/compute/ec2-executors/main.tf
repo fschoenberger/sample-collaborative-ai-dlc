@@ -99,8 +99,19 @@ resource "aws_iam_role_policy" "executor" {
           Resource = "arn:${local.partition}:neptune-db:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.neptune_cluster_resource_id}/*"
         },
         {
+          # Mirrors the AgentCore runtime policy, because an EC2 worker runs the
+          # same handler map — including create-workflow-checkpoint, whose
+          # TransactWriteItems is guarded by a ConditionCheck on the execution META
+          # item and therefore needs ConditionCheckItem as well as PutItem.
           Effect = "Allow"
-          Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+            "dynamodb:ConditionCheckItem",
+          ]
           Resource = compact([
             var.v2_executions_table_arn,
             "${var.v2_executions_table_arn}/index/*",

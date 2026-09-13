@@ -383,8 +383,22 @@ resource "aws_iam_role_policy" "agentcore" {
         },
         {
           # v2 process state table (+ its indexes) and the blocks table (read).
+          #
+          # ConditionCheckItem is needed because create-workflow-checkpoint writes
+          # through a TransactWriteItems whose guard is a ConditionCheck on another
+          # item. Without it every checkpoint failed with an authorization error
+          # that the engine catches and logs as a warning, so runs completed
+          # normally while silently never recording a checkpoint — and native
+          # export reads those checkpoints.
           Effect = "Allow"
-          Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+            "dynamodb:ConditionCheckItem",
+          ]
           Resource = compact([
             aws_dynamodb_table.v2_executions.arn,
             "${aws_dynamodb_table.v2_executions.arn}/index/*",
