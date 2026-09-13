@@ -163,8 +163,11 @@ const launchTemplatePlatform = () => ({
  * is the operator's most likely mistake and should say so here rather than at
  * first placement.
  */
-const readyEc2Revision = async ({ store, environment, revision, deps }) => {
-  const spec = revision.launchSpec;
+// Is this deployment able to run EC2 workers at all? Checked BEFORE anything is
+// created: a 503 raised after createEnvironment would leave an orphan record that
+// no retry could get past, because the create is conditional on the key being
+// absent. (Learned the hard way.)
+const assertEc2Configured = () => {
   const platform = launchTemplatePlatform();
   if (!platform.instanceProfileArn || !platform.securityGroupId || !platform.valkeyHost) {
     throw Object.assign(new Error('EC2 environments are not configured in this deployment'), {
@@ -172,6 +175,12 @@ const readyEc2Revision = async ({ store, environment, revision, deps }) => {
       code: 'EC2_NOT_CONFIGURED',
     });
   }
+  return platform;
+};
+
+const readyEc2Revision = async ({ store, environment, revision, deps }) => {
+  const spec = revision.launchSpec;
+  const platform = assertEc2Configured();
 
   const assertions = imageAssertions(spec);
   const described = await deps.ec2
@@ -451,6 +460,7 @@ export const createHandler = ({
         // An EC2 environment is an AMI plus a machine shape. No recipe, no base
         // environment to inherit tools from, and nothing to build.
         if (String(data.kind ?? 'AGENTCORE').toUpperCase() === 'EC2') {
+          assertEc2Configured();
           const validated = validateEc2LaunchSpec(data.launchSpec ?? data);
           if (!validated.valid) {
             return response(400, { error: 'Invalid launch spec', errors: validated.errors });
