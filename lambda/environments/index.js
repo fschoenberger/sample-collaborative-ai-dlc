@@ -2,6 +2,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { S3Client } from '@aws-sdk/client-s3';
 import { CodeBuildClient, StartBuildCommand } from '@aws-sdk/client-codebuild';
+import { EC2Client, DescribeImagesCommand } from '@aws-sdk/client-ec2';
 import { buildResponse } from '../shared/response.js';
 import { isPlatformAdmin, requirePlatformAdmin } from '../shared/authz.js';
 import {
@@ -33,6 +34,7 @@ import { createToolStore } from './tool-store.js';
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
 const codebuild = new CodeBuildClient({});
+const ec2 = new EC2Client({});
 const defaultStore = createEnvironmentStore({ ddb });
 const defaultToolStore = createToolStore({ ddb });
 
@@ -419,8 +421,9 @@ export const createHandler = ({
   toolStore = defaultToolStore,
   s3Client = s3,
   codebuildClient = codebuild,
+  ec2Client = ec2,
 } = {}) => {
-  const deps = { s3: s3Client, codebuild: codebuildClient };
+  const deps = { s3: s3Client, codebuild: codebuildClient, ec2: ec2Client, DescribeImagesCommand };
   const initialize = createRetryableInitializer(() => ensureSeeded(store));
   return async (event) => {
     const response = buildResponse(event);
