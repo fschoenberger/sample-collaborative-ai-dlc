@@ -44,7 +44,7 @@ import {
 } from '../shared/v2-execution-plan.js';
 import { resolveSkipTo, skipTargetsFrom, resolveRecomposeSkips } from '../shared/stage-skip.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
-import { resolveRuntimeTarget } from '../shared/runtime-target.js';
+import { resolveRuntimeTarget, resolveStageTarget } from '../shared/runtime-target.js';
 import {
   awaitEngineGate,
   parseChoice,
@@ -65,6 +65,7 @@ const defaultStore = createProcessStore({ ddb });
 const RUNTIME_ARN = () => process.env.AGENTCORE_RUNTIME_ARN;
 const BLOCKS_TABLE = () => process.env.BLOCKS_TABLE;
 const SOURCE_CONTROL_FN = () => process.env.SOURCE_CONTROL_FUNCTION;
+const SCHEDULER_FN = () => process.env.SCHEDULER_FUNCTION;
 const APPLICATION_URL = () => process.env.APPLICATION_URL;
 const DURABLE_EXECUTION_TIMEOUT_SECONDS = () =>
   Number(process.env.DURABLE_EXECUTION_TIMEOUT_SECONDS || 31622400);
@@ -153,6 +154,27 @@ const defaultSourceControlOperation = async ({
   return body.result;
 };
 
+// One call to the scheduler. The orchestrator is not VPC-attached and ElastiCache
+// has no public endpoint, so the scheduler Lambda is the only thing here that ever
+// speaks Valkey — rather than pulling the most critical component in the system
+// into the VPC for one control-plane hop.
+const defaultSchedulerOperation = async (input) => {
+  if (!SCHEDULER_FN()) throw new Error('SCHEDULER_FUNCTION is not configured');
+  const response = await lambda.send(
+    new InvokeCommand({
+      FunctionName: SCHEDULER_FN(),
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify(input)),
+    }),
+  );
+  if (response.FunctionError) {
+    // A placement failure must reach the stage loop as a VALUE (so it becomes a
+    // legible stage failure), never as a thrown transport error.
+    return { ok: false, reason: 'scheduler_invocation_failed' };
+  }
+  return parseLambdaPayload(response.Payload) ?? { ok: false, reason: 'scheduler_empty_response' };
+};
+
 const repoProvider = (meta, repoId) =>
   sharedRepoProvider(repoId, meta.gitProvider, meta.repoProviders);
 
@@ -186,6 +208,11 @@ const livePayloadFor = (type, summary) => {
 // cross the source-control service boundary; credentials never enter this process.
 const defaultDeps = () => ({
   store: defaultStore,
+  // Stage placement. Both worker kinds go through here; the scheduler decides
+  // whether that means waking an AgentCore session or launching an instance.
+  enqueueStage: (input) => defaultSchedulerOperation({ action: 'enqueue-stage', ...input }),
+  dispatchToWorker: (input) => defaultSchedulerOperation({ action: 'dispatch', ...input }),
+  releaseWorkers: (input) => defaultSchedulerOperation({ action: 'release', ...input }),
   loadPlan: (args) => loadExecutionPlan({ ddb, tableName: BLOCKS_TABLE(), ...args }),
   invokeRuntime: defaultInvokeRuntime,
   issueAgentCredentialGrant: (claims) => issueAgentCredentialGrant(ssm, claims),
@@ -795,6 +822,12 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         sessionId: stageSessionId,
         cloneInputs: stageCloneInputs,
         reviewFeedback,
+        // Where this stage is placed. Resolved per stage (not per intent) so a
+        // single run can mix AgentCore stages with EC2 ones; the scheduler owns
+        // the actual provisioning either way.
+        stageTarget: resolveStageTarget(meta, stage.stageId, RUNTIME_ARN()),
+        enqueueStage: deps.enqueueStage,
+        credentialBinding,
       };
       let result = await runStage(ctxArg, invokeIntentRuntime, {
         ...stageOpts,
@@ -1617,6 +1650,13 @@ const runStage = async (
     // callback result arrives to report the id.
     stageInstanceId,
     store,
+    // Placement (see resolveStageTarget). `enqueueStage` hands the job to the
+    // scheduler, which provisions or wakes a worker and puts the job where that
+    // worker will find it. The VERDICT path is unchanged: the worker completes the
+    // same durable callback created below, whichever kind of machine it is.
+    stageTarget,
+    enqueueStage,
+    credentialBinding = null,
   },
 ) => {
   // The attempt key names every durable identity for this stage attempt. It
@@ -1647,53 +1687,78 @@ const runStage = async (
     return result;
   };
 
+  // The stage payload. Identical whichever kind of worker runs it — that parity
+  // is the whole point of routing both kinds through one scheduler.
+  const stagePayload = () => ({
+    command: 'run-stage-start',
+    // Launch-latency anchor (cold start metric): stamped at dispatch,
+    // INSIDE the step so a memoized replay never re-stamps it. The
+    // container computes agentLaunchMs = accept − dispatchedAt, covering
+    // the InvokeAgentRuntime hop + any microVM cold start.
+    dispatchedAt: nowIso(),
+    ...ids,
+    stageId: stage.stageId,
+    // Unit lane (WP4): run-stage derives the per-unit instance id, stamps
+    // the slug on every row/event/broadcast, and scopes the prompt.
+    unitSlug,
+    sectionIndex,
+    workflowId,
+    workflowVersion,
+    ...(aidlcRepoRef ? { aidlcRepoRef } : {}),
+    ...(methodologyPins ? { methodologyPins } : {}),
+    scope,
+    ...(skipStageIds?.length ? { skipStageIds } : {}),
+    ...(composedGrid ? { composedGrid } : {}),
+    ...(cliModels ? { cliModels } : {}),
+    ...(tierModels ? { tierModels } : {}),
+    ...(requestedCli ? { requestedCli } : {}),
+    ...(mcpServersByTier ? { mcpServersByTier } : {}),
+    ...(customRules ? { customRules } : {}),
+    ...(attachments ? { attachments } : {}),
+    // Repository and branch references for source self-heal. AgentCore
+    // resolves a short-lived credential directly from the broker.
+    ...cloneInputs,
+    resumeFrom: resumeFrom ?? null,
+    reviewFeedback: reviewFeedback
+      ? {
+          batchId: reviewFeedback.batchId ?? null,
+          prompt: reviewFeedback.prompt,
+          targets: reviewFeedback.targets ?? [],
+        }
+      : null,
+    stageCallbackId,
+  });
+
   const dispatch = await ctx.step(`run-${attemptKey}`, async () =>
-    invokeRuntime(
-      {
-        command: 'run-stage-start',
-        // Launch-latency anchor (cold start metric): stamped at dispatch,
-        // INSIDE the step so a memoized replay never re-stamps it. The
-        // container computes agentLaunchMs = accept − dispatchedAt, covering
-        // the InvokeAgentRuntime hop + any microVM cold start.
-        dispatchedAt: nowIso(),
-        ...ids,
-        stageId: stage.stageId,
-        // Unit lane (WP4): run-stage derives the per-unit instance id, stamps
-        // the slug on every row/event/broadcast, and scopes the prompt.
-        unitSlug,
-        sectionIndex,
-        workflowId,
-        workflowVersion,
-        ...(aidlcRepoRef ? { aidlcRepoRef } : {}),
-        ...(methodologyPins ? { methodologyPins } : {}),
-        scope,
-        ...(skipStageIds?.length ? { skipStageIds } : {}),
-        ...(composedGrid ? { composedGrid } : {}),
-        ...(cliModels ? { cliModels } : {}),
-        ...(tierModels ? { tierModels } : {}),
-        ...(requestedCli ? { requestedCli } : {}),
-        ...(mcpServersByTier ? { mcpServersByTier } : {}),
-        ...(customRules ? { customRules } : {}),
-        ...(attachments ? { attachments } : {}),
-        // Repository and branch references for source self-heal. AgentCore
-        // resolves a short-lived credential directly from the broker.
-        ...cloneInputs,
-        resumeFrom: resumeFrom ?? null,
-        reviewFeedback: reviewFeedback
-          ? {
-              batchId: reviewFeedback.batchId ?? null,
-              prompt: reviewFeedback.prompt,
-              targets: reviewFeedback.targets ?? [],
-            }
-          : null,
-        stageCallbackId,
-      },
+    enqueueStage({
+      executionId: ids.executionId,
+      stageId: stage.stageId,
+      stageInstanceId,
+      unitSlug,
+      // A resume is a distinct attempt, so it needs a distinct job id.
+      attempt: resumeFrom || reviewFeedback ? 2 : 1,
+      target: stageTarget,
+      stageCallbackId,
+      projectId: ids.projectId,
+      // The grant itself is NOT minted here: it lives 300s, and the gap to a
+      // worker claiming the job is an instance cold boot. The scheduler mints it
+      // at claim time from this binding, after checking the registry agrees the
+      // asking worker holds the job.
+      credentialBinding,
+      // AgentCore places onto THIS session, because affinity is what keeps the
+      // checkout warm between stages. Ignored for an EC2 target.
       sessionId,
-    ),
+      // A parked AgentCore session is released on park and re-woken here, so the
+      // resume is an ordinary placement. Only an EC2 worker held across a park
+      // (parkPolicy: hold) needs addressing, and the scheduler resolves that from
+      // the registry rather than the orchestrator tracking worker ids.
+      resumeWorkerId: null,
+      payload: stagePayload(),
+    }),
   );
-  // The accept response only says "job started" — a refusal (unknown command on
-  // an old container, duplicate job, missing fields) fails the stage HERE; the
-  // verdict for an accepted job always travels through the callback.
+  // The accept response only says "job placed" — a refusal (capacity exhausted, a
+  // provisioner failure, an unresolvable target) fails the stage HERE; the verdict
+  // for a placed job always travels through the callback.
   if (!dispatch || dispatch.ok === false || dispatch.error) {
     return reconcileFailure({
       ok: false,

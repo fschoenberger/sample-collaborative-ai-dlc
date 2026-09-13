@@ -183,6 +183,11 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     pipeline.hset(key, {
       jobId: job.jobId,
       executionId: job.executionId,
+      projectId: job.projectId ?? '',
+      // The named credential provider for this job, JSON-encoded. Carries no
+      // secret; it exists so the grant can be minted when a worker CLAIMS the job
+      // rather than when it was enqueued, which would race the 300s grant TTL.
+      credentialBinding: job.credentialBinding ? JSON.stringify(job.credentialBinding) : '',
       stageInstanceId: job.stageInstanceId ?? '',
       stageId: job.stageId ?? '',
       unitSlug: job.unitSlug ?? '',

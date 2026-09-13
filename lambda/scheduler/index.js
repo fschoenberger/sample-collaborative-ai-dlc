@@ -25,6 +25,8 @@
 // why it lives in shared/ rather than in this package.
 
 import { EC2Client, DescribeInstancesCommand } from '@aws-sdk/client-ec2';
+import { SSMClient } from '@aws-sdk/client-ssm';
+import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
 import { createRegistry } from '../shared/valkey/registry.js';
 import { getClient } from '../shared/valkey/client.js';
 import { strategyFor } from './strategies.js';
@@ -36,6 +38,7 @@ import {
 } from './provisioners.js';
 
 const ec2 = new EC2Client({});
+const ssm = new SSMClient({});
 
 const SUBNET_IDS = () =>
   (process.env.EXECUTOR_SUBNET_IDS ?? '')
@@ -77,6 +80,8 @@ export const createScheduler = ({
   provisioners,
   subnetIds = SUBNET_IDS(),
   describeInstances = (input) => ec2.send(new DescribeInstancesCommand(input)),
+  leaseIdleMs = LEASE_IDLE_MS(),
+  issueAgentCredentialGrantFn = (claims) => issueAgentCredentialGrant(ssm, claims),
   clock = () => Date.now(),
 } = {}) => {
   const enqueueStage = async ({
@@ -89,6 +94,8 @@ export const createScheduler = ({
     stageCallbackId,
     resumeWorkerId = null,
     sessionId = null,
+    projectId = null,
+    credentialBinding = null,
     payload = {},
   }) => {
     if (!target?.kind) {
@@ -123,6 +130,10 @@ export const createScheduler = ({
     await registry.putJob({
       jobId,
       executionId,
+      projectId,
+      // Named provider, no secret. Recorded so the grant can be minted at claim
+      // time rather than at dispatch, which would race the 300s grant TTL.
+      credentialBinding,
       stageInstanceId,
       stageId,
       unitSlug,
@@ -202,6 +213,40 @@ export const createScheduler = ({
     return { ok: true, action: 'provision', jobId, workerId };
   };
 
+  /**
+   * Mint an agent credential grant for a worker that is about to run a job.
+   *
+   * Grants live 300 seconds (AGENT_CREDENTIAL_GRANT_TTL_SECONDS), and the gap
+   * between enqueue and claim is an instance cold boot — minutes — so the
+   * orchestrator cannot mint one at dispatch without racing the TTL. It is minted
+   * HERE, at claim time, instead.
+   *
+   * The worker deliberately does not hold the signing secret: a worker able to
+   * sign its own grant would make the grant meaningless as an authorization. So it
+   * asks, and the answer is gated on the registry agreeing that this worker holds
+   * this job. `bindings` come off the job (recorded by the orchestrator, which
+   * knows the project's credential binding); they name a provider and carry no
+   * secret.
+   */
+  const issueGrant = async ({ workerId, jobId, purpose }) => {
+    const worker = await registry.getWorker(workerId);
+    if (!worker) return { ok: false, reason: 'worker_not_found' };
+    if (worker.currentJobId !== jobId) {
+      return { ok: false, reason: 'worker_does_not_hold_job' };
+    }
+    const job = await registry.getJob(jobId);
+    if (!job) return { ok: false, reason: 'job_not_found' };
+    const bindings = job.credentialBinding ? [JSON.parse(job.credentialBinding)] : [];
+    if (bindings.length === 0) return { ok: true, agentCredentialGrant: null };
+    const agentCredentialGrant = await issueAgentCredentialGrantFn({
+      purpose,
+      projectId: job.projectId,
+      executionId: job.executionId,
+      bindings,
+    });
+    return { ok: true, agentCredentialGrant };
+  };
+
   const dispatch = async ({ workerId, type, jobId = '', reason = '' }) => {
     const worker = await registry.getWorker(workerId);
     if (!worker) return { ok: false, reason: 'worker_not_found' };
@@ -257,10 +302,7 @@ export const createScheduler = ({
     const expired = [];
 
     for (const environmentId of environmentIds) {
-      for (const entry of await registry.claimAbandoned({
-        environmentId,
-        idleMs: LEASE_IDLE_MS(),
-      })) {
+      for (const entry of await registry.claimAbandoned({ environmentId, idleMs: leaseIdleMs })) {
         // Mark it and ack it. The orchestrator opens the next attempt — this must
         // NOT redeliver the job, because two workers completing one durable
         // callback is the failure the whole design exists to prevent.
@@ -335,6 +377,7 @@ export const createScheduler = ({
     releaseWorker,
     releaseExecution,
     describeFleet,
+    issueGrant,
     reconcile,
     reapOrphans,
   };
@@ -365,6 +408,8 @@ export const handler = async (event, _context, scheduler = defaultScheduler()) =
           : await scheduler.releaseWorker(event);
       case 'describe-fleet':
         return await scheduler.describeFleet(event);
+      case 'issue-grant':
+        return await scheduler.issueGrant(event);
       case 'reconcile':
         return await scheduler.reconcile(event);
       default:

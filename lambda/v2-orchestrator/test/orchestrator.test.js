@@ -112,12 +112,14 @@ const META = {
 
 let deps;
 let invokes;
+let enqueued;
 let checkpointInvokes;
 let sessions;
 let ctx;
 beforeEach(() => {
   invokes = [];
   checkpointInvokes = [];
+  enqueued = [];
   sessions = [];
   ctx = makeCtx();
   deps = {
@@ -140,6 +142,11 @@ beforeEach(() => {
       plan: { stages: [{ stageId: 'a' }, { stageId: 'b' }] },
     })),
     invokeRuntime: null, // bound to ctx below
+    // Stage placement. Stands in for scheduler + worker together: it records the
+    // placement decision inputs, then drives the SAME container fake the
+    // pre-scheduler path used, so every existing run-stage-start assertion stays
+    // meaningful while the new placement inputs are also observable.
+    enqueueStage: null, // bound to ctx below
     issueAgentCredentialGrant: vi.fn(async () => 'test-agent-credential-grant'),
     stopSession: vi.fn(async () => ({ stopped: true })),
     broadcast: vi.fn(async () => {}),
@@ -148,7 +155,19 @@ beforeEach(() => {
     applicationUrl: 'https://aidlc.example.test/',
   };
   deps.invokeRuntime = makeRuntime(ctx, okScript);
+  deps.enqueueStage = vi.fn(makeEnqueue(deps));
 });
+
+// The scheduler + worker, collapsed into one double. `enqueued` captures what the
+// orchestrator asked the scheduler for (target, session, callback); the payload is
+// then handed to the container fake exactly as a real worker would.
+const makeEnqueue = (deps) =>
+  vi.fn(async ({ payload, target, sessionId, stageCallbackId, resumeWorkerId, attempt }) => {
+    enqueued.push({ target, sessionId, stageCallbackId, resumeWorkerId, attempt });
+    const accepted = await deps.invokeRuntime(payload, sessionId);
+    if (!accepted?.ok) return accepted ?? { ok: false, reason: 'stage_dispatch_failed' };
+    return { ok: true, action: 'provision', jobId: `job-${enqueued.length}`, workerId: 'w-test' };
+  });
 
 const stageStarts = () => invokes.filter((p) => p.command === 'run-stage-start');
 
@@ -184,9 +203,16 @@ describe('orchestrator durable handler', () => {
       repos: ['owner/repo'],
     });
     expect(initWs).not.toHaveProperty('gitToken');
-    expect(deps.invokeRuntime.mock.calls.map(([, , target]) => target)).toEqual(
-      Array.from({ length: 6 }, () => MANAGED_RUNTIME_TARGET),
+    // Engine container calls still carry the intent's runtime target. Stage
+    // dispatch no longer does: placement is the scheduler's job now, and the
+    // per-stage target it received is asserted through `enqueued` instead.
+    const engineTargets = deps.invokeRuntime.mock.calls
+      .filter(([payload]) => payload.command !== 'run-stage-start')
+      .map(([, , target]) => target);
+    expect(engineTargets).toEqual(
+      Array.from({ length: engineTargets.length }, () => MANAGED_RUNTIME_TARGET),
     );
+    expect(enqueued.every((e) => e.target?.kind === 'AGENTCORE')).toBe(true);
     const statuses = deps.store.updateExecution.mock.calls.map((c) => c[0].status);
     expect(statuses).toContain('RUNNING');
     expect(statuses).toContain('SUCCEEDED');
@@ -198,7 +224,16 @@ describe('orchestrator durable handler', () => {
     expect(starts.length).toBe(2);
     for (const s of starts) {
       expect(s.stageCallbackId).toMatch(/^cb-stage-cb-/);
-      expect(s.agentCredentialGrant).toBe('test-agent-credential-grant');
+      // The credential grant is deliberately NOT on the dispatched payload any
+      // more. It lives 300 seconds, and the gap between placing a job and a
+      // worker claiming it is an instance cold boot, so the scheduler mints it at
+      // claim time instead (scheduler `issue-grant`).
+      expect(s).not.toHaveProperty('agentCredentialGrant');
+    }
+    // …and every placement carries the binding the scheduler needs to mint it.
+    expect(enqueued).toHaveLength(2);
+    for (const placement of enqueued) {
+      expect(placement.stageCallbackId).toMatch(/^cb-stage-cb-/);
     }
     // Distinct callback per stage attempt (attribution).
     expect(new Set(starts.map((s) => s.stageCallbackId)).size).toBe(2);
@@ -215,8 +250,10 @@ describe('orchestrator durable handler', () => {
     await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
 
     expect(deps.store.getExecution).toHaveBeenCalledWith('i1', { consistentRead: true });
-    expect(deps.issueAgentCredentialGrant).toHaveBeenCalledWith(
-      expect.objectContaining({ bindings: [pinnedBinding] }),
+    // The pin reaches the SCHEDULER rather than being minted here: issuance moved
+    // to claim time so it cannot race the 300s grant TTL across a cold boot.
+    expect(deps.enqueueStage).toHaveBeenCalledWith(
+      expect.objectContaining({ credentialBinding: pinnedBinding, projectId: 'p1' }),
     );
   });
 

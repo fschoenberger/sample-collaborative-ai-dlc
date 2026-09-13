@@ -336,9 +336,12 @@ describe.skipIf(!host)('scheduler', () => {
 
     it('abandons a job whose lease expired, and acks it so it is not redelivered', async () => {
       // Redelivering would risk two workers completing one durable callback.
+      // leaseIdleMs 0 means "anything pending", which is what a dead holder looks
+      // like once the real window has elapsed — without making the test wait it out.
       const environmentId = nextEnv();
       const scheduler = schedulerWith(stubProvisioners(), {
         describeInstances: noInstances,
+        leaseIdleMs: 0,
       });
       const { jobId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
       await client.xreadgroup(
@@ -359,6 +362,33 @@ describe.skipIf(!host)('scheduler', () => {
       // A second sweep must find nothing: the entry was acked.
       const second = await scheduler.reconcile({ environmentIds: [environmentId] });
       expect(second.abandoned).toEqual([]);
+    });
+
+    it('leaves a freshly claimed job alone inside the lease window', async () => {
+      // The inverse of the case above, and the one that matters in production: a
+      // worker that claimed a job seconds ago is alive, and abandoning its job
+      // would open a second attempt against a stage that is still running.
+      const environmentId = nextEnv();
+      const scheduler = schedulerWith(stubProvisioners(), {
+        describeInstances: noInstances,
+        leaseIdleMs: 5 * 60 * 1000,
+      });
+      const { jobId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await client.xreadgroup(
+        'GROUP',
+        CONSUMER_GROUP,
+        'w1',
+        'COUNT',
+        10,
+        'STREAMS',
+        environmentQueueKey(environmentId),
+        '>',
+      );
+
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.abandoned).toEqual([]);
+      expect((await registry.getJob(jobId)).state).toBe('PENDING');
     });
 
     it('releases a worker that launched but never registered', async () => {

@@ -5,6 +5,7 @@ import {
   WaitingOperationStatus,
 } from '@aws/durable-execution-sdk-js-testing';
 import { __durableHandler } from '../index.js';
+import { makeEnqueueDouble } from './enqueue-double.js';
 
 // ---------------------------------------------------------------------------
 // REAL replay coverage for the orchestrator's async stage flow (WP1).
@@ -105,6 +106,13 @@ const makeWorld = ({ stages = [{ stageId: 'a' }, { stageId: 'b' }] } = {}) => {
     broadcast: async () => {},
     applicationUrl: 'https://aidlc.example.test/',
   };
+  // Stage dispatch goes through the scheduler now; the double drives the same
+  // container fake above, so the replay assertions about invokes still hold.
+  world.placements = [];
+  world.deps.enqueueStage = makeEnqueueDouble(
+    (payload, sessionId) => world.deps.invokeRuntime(payload, sessionId),
+    world.placements,
+  );
   return world;
 };
 

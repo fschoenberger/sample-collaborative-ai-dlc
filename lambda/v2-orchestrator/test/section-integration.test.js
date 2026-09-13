@@ -11,6 +11,7 @@ import { __durableHandler } from '../index.js';
 import { initLane, mergeLane } from '../../agentcore/commands/lane.js';
 import { resolveConflict } from '../../agentcore/commands/resolve-conflict.js';
 import { runGit, commitAndPushAll, fetchOrigin } from '../../agentcore/git-engine.js';
+import { makeEnqueueDouble } from './enqueue-double.js';
 
 // ---------------------------------------------------------------------------
 // WP8 merge fixtures, pulled forward (docs/v2-parallel.md):
@@ -283,6 +284,7 @@ const makeWorld = ({ remote, unitPlan, fileFor, beforeStage = null, conflictAgen
     store,
     loadPlan: async () => PLAN,
     invokeRuntime,
+    enqueueStage: makeEnqueueDouble(invokeRuntime),
     resolveToken: async () => '',
     stopSession: async () => ({ stopped: true }),
     broadcast: async () => {},
