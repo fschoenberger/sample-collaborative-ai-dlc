@@ -98,7 +98,13 @@ for pkg in agentcore shared; do
   tar -C "${REPO}/lambda/${pkg}" --exclude=node_modules --exclude=test --exclude=.build \
     -cf - . | tar -C "${RUNNER_ROOT}/app/${pkg}" -xf -
 done
-(cd "${RUNNER_ROOT}/app/agentcore" && npm install --omit=dev --no-audit --no-fund)
+# Install at app/ level, NOT inside app/agentcore. Node resolves a bare import
+# from the IMPORTING file upwards, and app/shared/valkey/client.js imports
+# iovalkey — with node_modules only under app/agentcore, that resolution walks
+# past app/shared, past app/, and fails with ERR_MODULE_NOT_FOUND. One
+# node_modules at app/ is a parent of both packages, so both resolve.
+cp "${REPO}/lambda/agentcore/package.json" "${RUNNER_ROOT}/app/package.json"
+(cd "${RUNNER_ROOT}/app" && npm install --omit=dev --no-audit --no-fund)
 
 install -d "${RUNNER_ROOT}/bin"
 cat > "${RUNNER_ROOT}/bin/aidlc-runner" <<LAUNCHER
