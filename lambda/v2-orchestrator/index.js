@@ -1651,9 +1651,11 @@ const runStage = async (
     stageInstanceId,
     store,
     // Placement (see resolveStageTarget). `enqueueStage` hands the job to the
-    // scheduler, which provisions or wakes a worker and puts the job where that
-    // worker will find it. The VERDICT path is unchanged: the worker completes the
-    // same durable callback created below, whichever kind of machine it is.
+    // scheduler, which decides where it runs and gets it there — a queue an EC2
+    // instance polls, or the invoke that materializes an AgentCore session. Which
+    // of the two is the scheduler's business, not this file's. The VERDICT path is
+    // unchanged either way: the worker completes the same durable callback created
+    // below, whichever kind of machine it is.
     stageTarget,
     enqueueStage,
     credentialBinding = null,
@@ -1740,18 +1742,20 @@ const runStage = async (
       target: stageTarget,
       stageCallbackId,
       projectId: ids.projectId,
-      // The grant itself is NOT minted here: it lives 300s, and the gap to a
-      // worker claiming the job is an instance cold boot. The scheduler mints it
-      // at claim time from this binding, after checking the registry agrees the
-      // asking worker holds the job.
+      // A named provider, no secret. The grant itself is NOT minted here, because
+      // it lives 300s and for a queued job the gap to a worker claiming it is an
+      // instance cold boot. The scheduler mints from this binding at the moment the
+      // payload actually reaches a worker — claim time for queued work, dispatch
+      // time for an invoke.
       credentialBinding,
       // AgentCore places onto THIS session, because affinity is what keeps the
       // checkout warm between stages. Ignored for an EC2 target.
       sessionId,
-      // A parked AgentCore session is released on park and re-woken here, so the
-      // resume is an ordinary placement. Only an EC2 worker held across a park
-      // (parkPolicy: hold) needs addressing, and the scheduler resolves that from
-      // the registry rather than the orchestrator tracking worker ids.
+      // A parked AgentCore session is released on park and re-materialized by the
+      // next placement, so its resume is an ordinary placement. Only an EC2 worker
+      // held across a park (parkPolicy: hold) needs addressing, and the scheduler
+      // resolves that from the registry rather than the orchestrator tracking
+      // worker ids.
       resumeWorkerId: null,
       payload: stagePayload(),
     }),

@@ -1,8 +1,15 @@
-// The worker loop — what a placed worker actually does.
+// The worker loop — what an EC2 worker actually does.
 //
-// One loop, two worker kinds, no branches below identity resolution. An EC2
-// instance and an AgentCore session both: register, claim work, run it through
-// the SAME dispatchInvocation the HTTP server uses, ack, and exit when told.
+// Register, claim work off the environment queue, run it through the SAME
+// dispatchInvocation the HTTP server uses, ack, exit when told.
+//
+// EC2 ONLY, deliberately. An AgentCore session cannot run this loop: the platform
+// pauses a session whose /ping reports Healthy for idle_runtime_session_timeout
+// (900s), and a loop blocked on XREAD reports exactly that — so it would be
+// polling a queue only inside windows an invoke happened to open. AgentCore work
+// is delivered ON the invoke instead (see lambda/scheduler/provisioners.js). The
+// two kinds share the registry, the placement strategy and the release path; they
+// do not share delivery.
 //
 // WHY TWO READERS. A worker watches two streams:
 //
@@ -74,7 +81,6 @@ export const jobInvocation = (job) => {
 
 export const createWorker = ({
   workerId,
-  kind,
   environmentId,
   revisionId = null,
   client,
@@ -261,12 +267,14 @@ export const createWorker = ({
       // unreapable and leaks an instance.
       await registry.putWorker({
         workerId,
-        kind,
+        kind: 'EC2',
         environmentId,
         revisionId,
         state: 'IDLE',
-        instanceId: kind === 'EC2' ? workerId : null,
-        sessionId: kind === 'AGENTCORE' ? workerId : null,
+        // The instance id, so the reconciler can terminate this worker. A
+        // self-registered row without it is unreapable and leaks an instance.
+        instanceId: workerId,
+        sessionId: null,
         createdAtMs: clock(),
         maxLifetimeSeconds,
         bootstrapTimeoutSeconds,
@@ -291,11 +299,11 @@ export const createWorker = ({
 };
 
 /**
- * Container entry for an EC2 worker: resolve identity from IMDS, wire the same
- * handlers the HTTP server uses, and run the loop.
+ * Runner entry: resolve identity from IMDS, wire the same handlers the HTTP server
+ * uses, and run the loop. Started by the systemd unit the AMI carries.
  *
- * Deliberately NOT used by the AgentCore image, which keeps its HTTP server for
- * the runtime health contract and starts its loop from the wake invocation.
+ * Not used by the AgentCore image, which keeps its HTTP server and receives work
+ * on the invoke.
  */
 export const main = async ({ env = process.env } = {}) => {
   const { dispatchInvocation } = await import('./http-server.js');
@@ -331,7 +339,6 @@ export const main = async ({ env = process.env } = {}) => {
 
   const worker = createWorker({
     workerId,
-    kind: 'EC2',
     environmentId,
     revisionId,
     maxLifetimeSeconds: Number(env.AIDLC_MAX_LIFETIME_SECONDS || 0),

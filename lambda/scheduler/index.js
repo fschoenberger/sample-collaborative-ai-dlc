@@ -27,6 +27,7 @@
 import { EC2Client, DescribeInstancesCommand } from '@aws-sdk/client-ec2';
 import { SSMClient } from '@aws-sdk/client-ssm';
 import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import { commandDefinition } from '../shared/agent-command-registry.js';
 import { createRegistry } from '../shared/valkey/registry.js';
 import { getClient } from '../shared/valkey/client.js';
 import { strategyFor } from './strategies.js';
@@ -120,6 +121,12 @@ export const createScheduler = ({
     });
 
     if (decision.action === 'queue') {
+      console.error('[scheduler] refusing placement for capacity', {
+        environmentId,
+        reason: decision.reason,
+        active: fleet.workers.length,
+        inFlight: fleet.inFlight,
+      });
       // Capacity is exhausted. Say so as a value rather than throwing: the
       // orchestrator turns it into a stage failure with a legible reason, and the
       // operator's remedy is a limit change, not a retry.
@@ -144,17 +151,27 @@ export const createScheduler = ({
       payload,
     });
 
-    if (decision.action === 'reuse') {
-      // Addressed, because the point of reuse here is that this specific worker
-      // holds the parked conversation. Putting it on the shared queue would let
-      // any worker take it and lose that context.
+    const provisioner = provisionerFor(target.kind, provisioners);
+
+    // Reuse of a QUEUE-delivered worker is an addressed dispatch: the point of
+    // reuse is that this specific instance holds the parked conversation, so
+    // putting the job on the shared queue would let any worker take it and lose
+    // that context.
+    //
+    // For an INVOKE-delivered worker there is no such thing as a reuse-without-
+    // delivery: the session may have been paused out from under us at any moment
+    // (idle_runtime_session_timeout, or the park's own stopRuntimeSession), and
+    // nothing tells us when. So reuse and provision collapse into the same act —
+    // invoke this session id — and the code below handles both. Writing to an
+    // addressed stream instead would have hung every AgentCore park-resume, which
+    // is the only reuse case the v1 strategy has.
+    if (decision.action === 'reuse' && provisioner.delivery === 'queue') {
       await registry.dispatchToWorker({ workerId: decision.workerId, type: 'job', jobId });
       const worker = await registry.getWorker(decision.workerId);
       if (worker) await registry.markBusy(worker, jobId);
       return { ok: true, action: 'reuse', jobId, workerId: decision.workerId };
     }
 
-    const provisioner = provisionerFor(target.kind, provisioners);
     // AgentCore's worker id IS its session id, because affinity is what keeps the
     // checkout warm across stages. EC2's is its instance id, known only after the
     // fleet call returns.
@@ -168,11 +185,36 @@ export const createScheduler = ({
           })())
         : provisionalWorkerId({ executionId, stageInstanceId, attempt });
 
-    // Enqueue BEFORE provisioning. A worker that boots fast enough to poll before
-    // this write would otherwise find an empty queue and idle out; the reverse
-    // order costs nothing, because an unclaimed job is exactly what the queue is
-    // for.
-    await registry.enqueueJob({ environmentId, jobId });
+    // QUEUE delivery: enqueue BEFORE provisioning. A worker that boots fast enough
+    // to poll before this write would otherwise find an empty queue and idle out;
+    // the reverse order costs nothing, because an unclaimed job is exactly what the
+    // queue is for.
+    if (provisioner.delivery === 'queue') {
+      await registry.enqueueJob({ environmentId, jobId });
+    }
+
+    // INVOKE delivery carries the payload on the call itself, so the credential
+    // grant is minted HERE. For a queued job the worker asks at claim time via
+    // issue-grant (a cold boot away, which would race the 300s TTL); for an invoke
+    // there is no such gap, so the same minting path is used without the round
+    // trip. Both end up handing the container an identical payload.
+    let invokePayload = null;
+    if (provisioner.delivery === 'invoke') {
+      const purpose = commandDefinition(payload.command)?.agentAuth;
+      const agentCredentialGrant = purpose
+        ? await mintGrant({
+            purpose,
+            projectId,
+            executionId,
+            credentialBinding,
+          })
+        : null;
+      invokePayload = {
+        ...payload,
+        stageCallbackId: stageCallbackId ?? payload.stageCallbackId,
+        ...(agentCredentialGrant ? { agentCredentialGrant } : {}),
+      };
+    }
 
     let provisioned;
     try {
@@ -181,8 +223,20 @@ export const createScheduler = ({
         workerId: provisionalId,
         executionId,
         subnetIds,
+        payload: invokePayload,
       });
     } catch (error) {
+      // LOG it. A provisioning failure used to be returned as a value and never
+      // written anywhere, so the stage failure said "check CloudWatch" and
+      // CloudWatch had nothing in it.
+      console.error('[scheduler] provision failed', {
+        kind: target.kind,
+        environmentId,
+        jobId,
+        code: error?.code,
+        message: error?.message,
+        errors: error?.errors,
+      });
       await registry.setJobState(jobId, 'FAILED', {
         failureReason: error.code ?? 'provision_failed',
       });
@@ -200,7 +254,13 @@ export const createScheduler = ({
       kind: target.kind,
       environmentId,
       revisionId: target.revisionId,
-      state: 'PROVISIONING',
+      // Invoke delivery means the job was accepted by the time we get here, so the
+      // worker is already BUSY. Calling it PROVISIONING would be a lie the
+      // reconciler acts on: it fails a PROVISIONING worker that never registers
+      // within bootstrapTimeoutSeconds, and an AgentCore session never registers
+      // because it has no poll loop to register from.
+      state: provisioned.delivered ? 'BUSY' : 'PROVISIONING',
+      ...(provisioned.delivered ? { currentJobId: jobId } : {}),
       executionId,
       stageInstanceId,
       instanceId: provisioned.instanceId,
@@ -236,15 +296,31 @@ export const createScheduler = ({
     }
     const job = await registry.getJob(jobId);
     if (!job) return { ok: false, reason: 'job_not_found' };
-    const bindings = job.credentialBinding ? [JSON.parse(job.credentialBinding)] : [];
-    if (bindings.length === 0) return { ok: true, agentCredentialGrant: null };
-    const agentCredentialGrant = await issueAgentCredentialGrantFn({
+    const agentCredentialGrant = await mintGrant({
       purpose,
       projectId: job.projectId,
       executionId: job.executionId,
-      bindings,
+      credentialBinding: job.credentialBinding ? JSON.parse(job.credentialBinding) : null,
     });
     return { ok: true, agentCredentialGrant };
+  };
+
+  /**
+   * The actual minting, shared by both delivery modes.
+   *
+   * Split out from `issueGrant` because that function's registry check is a guard
+   * on the WORKER asking — a worker must not be able to mint a grant for a job it
+   * does not hold. When the scheduler mints for its own invoke-delivery it has
+   * nothing to prove to itself, and the worker row does not exist yet anyway.
+   */
+  const mintGrant = async ({ purpose, projectId, executionId, credentialBinding }) => {
+    if (!credentialBinding) return null;
+    return issueAgentCredentialGrantFn({
+      purpose,
+      projectId,
+      executionId,
+      bindings: [credentialBinding],
+    });
   };
 
   const dispatch = async ({ workerId, type, jobId = '', reason = '' }) => {

@@ -1278,6 +1278,9 @@ const mapIntent = (meta) => ({
   cliModels: meta.cliModels ?? null,
   tierModels: meta.tierModels ?? null,
   environment: meta.environment ?? null,
+  // Per-stage placement snapshots. Written at create and read internally by
+  // resolveStageTarget; also forwarded here so the UI can show WHERE a stage ran.
+  stageEnvironments: meta.stageEnvironments ?? null,
   parkReleaseSeconds: meta.parkReleaseSeconds ?? null,
   maxParallelUnits: meta.maxParallelUnits ?? null,
   constructionAutonomyMode: meta.constructionAutonomyMode ?? null,

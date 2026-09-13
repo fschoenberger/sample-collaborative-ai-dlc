@@ -5,18 +5,34 @@
 // other is an AgentCore session, and everything else about them is identical.
 //
 //   EC2       CreateFleet against the revision's pinned launch template.
-//   AGENTCORE InvokeAgentRuntime with a trivial `wake` payload.
+//   AGENTCORE InvokeAgentRuntime against the intent's session id.
 //
-// Why AgentCore needs a "wake" at all: InvokeAgentRuntime currently does two jobs
-// — it materializes the microVM (creating it, or routing to the existing one for
-// that runtimeSessionId) AND delivers the job. Valkey takes over delivery, so the
-// invoke keeps only materialization. It cannot be dropped, because a microVM
-// cannot spontaneously exist: AgentCore has no "start a session and leave it
-// running" API, sessions are a side effect of an invoke.
+// DELIVERY. Each provisioner also declares HOW work reaches it, because that is
+// not the same for the two kinds and pretending otherwise was a mistake:
 //
-// Consequence worth stating: the wake must target the RIGHT session id, because
-// session affinity is what keeps the git checkout warm across stages. So an
-// AgentCore worker's id IS its session id.
+//   EC2       `delivery: 'queue'`  — the instance polls {e:<envId>}:queue for its
+//             whole life, so launching it and giving it work are separate acts.
+//   AGENTCORE `delivery: 'invoke'` — the invoke IS the delivery.
+//
+// Why AgentCore cannot use the queue. InvokeAgentRuntime does two things at once:
+// it materializes the microVM (creating it, or routing to the existing one for
+// that runtimeSessionId) AND delivers the payload. The materialization half cannot
+// be dropped — AgentCore has no "start a session and leave it running" API,
+// sessions exist only as a side effect of an invoke — and the platform pauses a
+// session that reports /ping Healthy for idle_runtime_session_timeout (900s).
+//
+// So a session cannot be relied on to be polling anything. Routing its work
+// through a queue would mean an invoke to make the session exist, followed by a
+// queue read that only happens inside the window that invoke opened — all the
+// machinery of a queue for none of its benefit, plus a lease and a heartbeat
+// fighting the platform's own idle detection. The queue's real benefits (claim
+// contention, work stealing, warm pools) all presume fungible, continuously
+// polling workers; an AgentCore session is neither. Its id is SEMANTIC — it is one
+// intent's warm checkout, which is why placement means "invoke THIS session" and
+// why an AgentCore worker's id IS its session id.
+//
+// What the two kinds do still share is everything above delivery: one registry,
+// one placement strategy, one cost and observability surface, one release path.
 
 import { EC2Client, CreateFleetCommand, TerminateInstancesCommand } from '@aws-sdk/client-ec2';
 import {
@@ -121,6 +137,10 @@ export const instanceRequirementsFor = (launchSpec) => {
 export const createEc2Provisioner = ({ client = new EC2Client({}), env = process.env } = {}) => ({
   kind: 'EC2',
 
+  // An EC2 worker polls the environment queue for its whole life, so launching it
+  // and giving it work are genuinely separate acts. See DELIVERY above.
+  delivery: 'queue',
+
   /**
    * Launch exactly one worker. `type: 'instant'` makes CreateFleet synchronous:
    * it returns the instance id or the reason it could not, rather than leaving an
@@ -212,12 +232,20 @@ export const createEc2Provisioner = ({ client = new EC2Client({}), env = process
 export const createAgentCoreProvisioner = ({ client = new BedrockAgentCoreClient({}) } = {}) => ({
   kind: 'AGENTCORE',
 
+  // The invoke that materializes the session also delivers the job, so nothing
+  // for this kind travels on the environment queue. See DELIVERY above.
+  delivery: 'invoke',
+
   /**
-   * Wake a session so its worker loop starts. The payload is deliberately inert:
-   * the real job is already on the Valkey queue, and this call exists only to
-   * make the microVM exist.
+   * Materialize the session AND hand it the job — one call, because for AgentCore
+   * they cannot be separated.
+   *
+   * `run-stage-start` accepts in milliseconds and runs the stage as a background
+   * job that completes the durable callback itself, so this returns fast without
+   * any queue in the middle. The busy tracker holds `/ping` at HealthyBusy for the
+   * job's lifetime, which is what keeps the session alive while the stage runs.
    */
-  async provision({ target, workerId }) {
+  async provision({ target, workerId, payload }) {
     // The worker id IS the session id for AgentCore — affinity is what keeps the
     // checkout warm, so the two cannot be allowed to diverge.
     const response = await client.send(
@@ -227,13 +255,25 @@ export const createAgentCoreProvisioner = ({ client = new BedrockAgentCoreClient
         runtimeSessionId: workerId,
         contentType: 'application/json',
         accept: 'application/json',
-        payload: Buffer.from(JSON.stringify({ command: 'wake', workerId })),
+        payload: Buffer.from(JSON.stringify(payload)),
       }),
     );
-    // A wake returns as soon as the loop is up; there is no verdict to read here.
-    // Draining the body anyway keeps the SDK from holding the socket open.
-    if (response.response?.transformToString) await response.response.transformToString();
-    return { workerId, sessionId: workerId, instanceId: null, fleetId: null };
+    // Drain the body: the accept-then-background reply carries no verdict, but
+    // leaving it unread holds the socket open.
+    const body = response.response?.transformToString
+      ? await response.response.transformToString()
+      : null;
+    // A non-2xx is a delivery failure and must fail the placement, not sit in a
+    // queue nobody is draining.
+    if (response.statusCode && response.statusCode >= 300) {
+      throw Object.assign(
+        new Error(`InvokeAgentRuntime returned ${response.statusCode}: ${body}`),
+        {
+          code: 'AGENTCORE_DELIVERY_FAILED',
+        },
+      );
+    }
+    return { workerId, sessionId: workerId, instanceId: null, fleetId: null, delivered: true };
   },
 
   async terminate({ worker, target }) {

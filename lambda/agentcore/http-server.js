@@ -94,10 +94,23 @@ export const dispatchInvocation = async ({
   now = () => new Date().toISOString(),
 }) => {
   const command = payload?.command;
-  if (!command) return { statusCode: 400, body: { error: 'missing "command"' } };
+  if (!command) {
+    console.error('[agentcore] rejected invocation with no command');
+    return { statusCode: 400, body: { error: 'missing "command"' } };
+  }
   const definition = commandDefinition(command);
   const handler = definition ? handlers[definition.handler] : null;
-  if (!handler) return { statusCode: 400, body: { error: `unknown command "${command}"` } };
+  if (!handler) {
+    // LOG it: a 400 travels back to the caller as an opaque SDK error, so an
+    // unregistered or misspelled command was previously invisible in CloudWatch —
+    // which is exactly where the resulting stage failure tells you to look.
+    console.error('[agentcore] unknown command', {
+      command,
+      known: Boolean(definition),
+      handler: definition?.handler ?? null,
+    });
+    return { statusCode: 400, body: { error: `unknown command "${command}"` } };
+  }
 
   busy?.enter();
   try {

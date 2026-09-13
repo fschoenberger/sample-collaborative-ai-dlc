@@ -578,6 +578,15 @@ export const createHandler = ({
             error: 'The Standard environment follows the protected core runtime',
           });
         }
+        // An EC2 environment has no recipe to revise. Falling through would run
+        // prepareCatalogRecipe and store launchSpec: undefined, leaving a corrupt
+        // DRAFT as currentRevisionId. Recreate the environment instead.
+        if ((environment.kind ?? 'AGENTCORE') === 'EC2') {
+          return response(409, {
+            error: 'An EC2 environment cannot be revised; create a new one with the desired AMI',
+            code: 'EC2_NOT_REVISABLE',
+          });
+        }
         assertCatalogRevision(
           environmentId,
           await store.getRevision(environmentId, environment.currentRevisionId),
