@@ -48,10 +48,13 @@ const fleetTags = ({
   ...Object.entries(extra).map(([Key, Value]) => ({ Key, Value: String(Value) })),
 ];
 
-// CreateFleet overrides carry the parts of the spec a launch template cannot:
-// instance selection, subnet and spot price. ImageId is deliberately NOT overridden
-// here — it lives in the template, pinned per revision, so a running intent's
-// placement cannot drift when the environment is republished.
+// CreateFleet overrides carry the parts of the spec that vary per placement:
+// instance selection, subnet and spot price. The AMI is NOT here because ImageId is
+// not an overridable field at all — it can only come from the launch template,
+// which is why the template is created per environment revision.
+//
+// Note an `instant` request permits only ONE subnet id per override, hence one
+// override per (subnet, instance type) pair rather than a comma-joined list.
 // The caller resolves launchSpec.availabilityZones to the matching subnet ids
 // before calling, so by here `subnetIds` is already the permitted set.
 const fleetOverrides = ({ launchSpec, subnetIds }) => {

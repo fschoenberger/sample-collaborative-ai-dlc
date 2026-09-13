@@ -7,11 +7,17 @@
 // vars, the spec-derived parts come from the revision, and a clientToken makes it
 // idempotent.
 //
-// Per revision rather than one shared template because:
-//   - `CreateFleet` overrides can set instance types, subnet, AZ and price, but
-//     NOT user-data and NOT block device mappings, and those vary per environment;
-//   - a published revision needs a FROZEN launch identity, so republishing an
-//     environment cannot move where an already-running intent places its stages.
+// Per revision rather than one shared template, for a reason the API dictates:
+// `ImageId` is NOT among the fields `FleetLaunchTemplateOverridesRequest` accepts
+// (it takes availabilityZone, availabilityZoneId, blockDeviceMappings,
+// iamInstanceProfile, instanceRequirements, instanceType, keyName, maxPrice,
+// metadataOptions, networkInterfaces, placement, priority, subnetId,
+// weightedCapacity). So the AMI can only come from the template — and the AMI is
+// per environment revision. `userData` is likewise not overridable.
+//
+// It also gives the property we want anyway: a published revision has a FROZEN
+// launch identity, so republishing an environment cannot move where an
+// already-running intent places its stages.
 //
 // WHAT THE AMI MUST PROVIDE. The worker runtime lives IN the AMI: an operator
 // builds it with scripts/provision-worker-ami.sh, which installs Node, the agent
