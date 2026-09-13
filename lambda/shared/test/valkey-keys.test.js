@@ -7,7 +7,7 @@ import {
   jobMetaKey,
   workerMetaKey,
   workerStreamKey,
-} from '../keys.js';
+} from '../valkey/keys.js';
 
 // These assertions are the ONLY place cluster slot correctness is checked. The
 // test Valkey is a single node and will happily execute a pipeline whose keys
