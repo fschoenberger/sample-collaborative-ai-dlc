@@ -58,6 +58,17 @@ export const runnerEnvironment = ({ spec, environmentId, revisionId, platform })
   AWS_REGION: platform.region,
   RUNTIME_COMPATIBILITY_VERSION: String(platform.runtimeCompatibilityVersion ?? '1'),
   V2_WORKSPACE_DIR: spec.workspacePath ?? '/mnt/workspace',
+  // HOME, because systemd gives a service NONE and git refuses to run without
+  // one — "fatal: $HOME not set". The first real stage placed on an instance died
+  // exactly here: the worker registered, claimed its job and opened the callback
+  // heartbeat, then every git call failed and it surfaced as
+  // `workspace_restore_failed: could not re-clone`. git also needs it to find
+  // ~/.gitconfig and the credential helper the engine writes.
+  //
+  // Set from user-data as well as in the AMI's unit file, deliberately: an
+  // operator's older AMI predates the unit fix, and this makes such an image work
+  // rather than fail on its first clone.
+  HOME: '/root',
   // The reconciler enforces these, and a self-registering worker can only report
   // them if it is told them.
   AIDLC_MAX_LIFETIME_SECONDS: String(spec.maxLifetimeSeconds ?? 0),

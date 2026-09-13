@@ -140,6 +140,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# HOME, because systemd starts a service with NO \$HOME and git refuses to run
+# without one: "fatal: \$HOME not set". That killed the first real stage placed on
+# an instance — the worker registered, claimed the job and opened its callback
+# heartbeat, then every git invocation died, surfacing as
+# workspace_restore_failed: could not re-clone. git also needs it to find
+# ~/.gitconfig and the credential helper the engine writes.
+Environment=HOME=/root
 EnvironmentFile=/etc/aidlc-runner.env
 ExecStart=${RUNNER_ROOT}/bin/aidlc-runner
 Restart=on-failure

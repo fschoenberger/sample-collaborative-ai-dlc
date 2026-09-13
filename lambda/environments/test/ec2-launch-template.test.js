@@ -77,6 +77,15 @@ describe('renderUserData', () => {
       platform: platform(),
     });
 
+  it('sets HOME, because git refuses to run without one', () => {
+    // REGRESSION: systemd gives a service no $HOME, and every git invocation dies
+    // with "fatal: $HOME not set". The first stage ever placed on an instance
+    // registered, claimed its job and opened the callback heartbeat, then failed as
+    // `workspace_restore_failed: could not re-clone` — a one-word omission that
+    // breaks the one thing every stage does first.
+    expect(userData()).toMatch(/^HOME=\/root$/m);
+  });
+
   it('fails loudly when the AMI has no runner installed', () => {
     // The runner is baked in by provision-worker-ami.sh. If it is absent this AMI
     // was never provisioned for AI-DLC, and an instance that keeps running would
