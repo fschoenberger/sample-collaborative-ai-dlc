@@ -131,6 +131,120 @@ describe.skipIf(!host)('registry against a real Valkey', () => {
       expect(await client.smembers(`{e:${environmentId}}:workers`)).toEqual([]);
     });
 
+    it('leases an EC2 row and gives an AgentCore row no expiry at all', async () => {
+      // The EC2 row IS the lease: its worker renews it from the poll loop. Nothing
+      // beats an AgentCore row — it is a placement record removed on release — so it
+      // gets no TTL. A long one picked so it "never fires" would be an expiry that
+      // means nothing, which is the 12h TTL this design replaced.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const instance = worker({ environmentId });
+      const session = worker({
+        environmentId,
+        kind: 'AGENTCORE',
+        state: 'BUSY',
+        workerId: 'aidlc-intent-lease',
+      });
+      await registry.putWorker(instance);
+      await registry.putWorker(session);
+
+      const instanceTtl = await client.ttl(`{w:${instance.workerId}}:meta`);
+      expect(instanceTtl).toBeGreaterThan(0);
+      expect(instanceTtl).toBeLessThanOrEqual(5 * 60);
+      // -1 is "exists, no expiry"; -2 would be "gone".
+      expect(await client.ttl(`{w:${session.workerId}}:meta`)).toBe(-1);
+    });
+
+    it('leases a PROVISIONING row exactly like any other EC2 row', async () => {
+      // A launching instance is not a special case. If its runner never boots, the
+      // row expiring is accurate — it was claiming a worker exists and none does —
+      // and reapOrphans is what terminates the instance if one did come up. Any
+      // grace period here is how a TTL nobody renews creeps back in.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const w = worker({ environmentId, state: 'PROVISIONING' });
+      await registry.putWorker(w);
+
+      const ttl = await client.ttl(`{w:${w.workerId}}:meta`);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(5 * 60);
+    });
+
+    it('does not renew the lease on a state transition — only a heartbeat does', async () => {
+      // markBusy and the draining mark are written by the SCHEDULER. If those
+      // renewed the lease, the scheduler would be holding a row alive on behalf of a
+      // worker that may be dead, and the lease would stop being the worker's own
+      // liveness claim.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const w = worker({ environmentId, state: 'IDLE' });
+      await registry.putWorker(w);
+      const key = `{w:${w.workerId}}:meta`;
+
+      await client.expire(key, 20);
+      await registry.markBusy({ ...w, environmentId }, 'job-1');
+
+      expect(await client.ttl(key)).toBeLessThanOrEqual(20);
+      expect((await registry.getWorker(w.workerId)).state).toBe('BUSY');
+    });
+
+    it('refuses to resurrect an expired row on a state transition', async () => {
+      // HSET creates the key it writes to, so a transition landing just after the
+      // lease expired would rebuild the row as a partial with no kind, no
+      // instanceId and — since only putWorker sets one — no TTL at all: an immortal
+      // row counting against maxInstances forever.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const w = worker({ environmentId, state: 'IDLE' });
+      await registry.putWorker(w);
+      const key = `{w:${w.workerId}}:meta`;
+
+      await client.del(key);
+
+      expect(await registry.setWorkerState(w.workerId, 'BUSY', { currentJobId: 'j-1' })).toBeNull();
+      expect(await registry.markIdle({ ...w, environmentId })).toBeNull();
+      expect(await client.exists(key)).toBe(0);
+      expect(await client.zrange(`{e:${environmentId}}:idle`, 0, -1)).toEqual([]);
+    });
+
+    it('renews the lease on every heartbeat', async () => {
+      // Without the EXPIRE, lastSeenAtMs is a timestamp nobody enforces and the
+      // row outlives the worker by 12 hours.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const w = worker({ environmentId, state: 'IDLE' });
+      await registry.putWorker(w);
+      const key = `{w:${w.workerId}}:meta`;
+
+      // Burn most of the lease, then beat.
+      await client.expire(key, 20);
+      expect(await client.ttl(key)).toBeLessThanOrEqual(20);
+      expect(await registry.heartbeat(w.workerId)).toBe(true);
+
+      expect(await client.ttl(key)).toBeGreaterThan(20);
+    });
+
+    it('lets an unrenewed lease expire, and does not resurrect it', async () => {
+      // Expiry is the liveness signal: the worker ceases to exist without any
+      // sweep comparing timestamps. A worker able to beat its own row back into
+      // existence would not be holding a lease at all.
+      const registry = registryFor();
+      const environmentId = nextEnv();
+      const w = worker({ environmentId });
+      await registry.putWorker(w);
+      const key = `{w:${w.workerId}}:meta`;
+
+      await client.pexpire(key, 1);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      expect(await registry.getWorker(w.workerId)).toBeNull();
+      expect(await registry.heartbeat(w.workerId)).toBe(false);
+      expect(await client.exists(key)).toBe(0);
+      // The set is a convenience index, so the id lingers until pruned on read.
+      expect(await registry.listWorkers(environmentId)).toEqual([]);
+      expect(await client.smembers(`{e:${environmentId}}:workers`)).toEqual([]);
+    });
+
     it('beats a live worker and refuses to resurrect a reaped one', async () => {
       const registry = registryFor();
       const environmentId = nextEnv();

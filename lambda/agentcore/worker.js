@@ -251,8 +251,10 @@ export const createWorker = ({
   const beat = async () => {
     const alive = await registry.heartbeat(workerId).catch(() => true);
     if (!alive) {
-      // The registry row is gone, so the reconciler has already written this
-      // worker off. Keeping it running would burn an instance nobody will reap.
+      // The row is gone: this beat came too late to renew the lease, or the
+      // reconciler released the worker outright. Either way it has been written
+      // off, and a written-off worker that keeps claiming jobs is worse than one
+      // that exits — so exit, and let reapOrphans collect the instance.
       logger.error?.('[worker] registry row is gone; exiting');
       shuttingDown = true;
     }

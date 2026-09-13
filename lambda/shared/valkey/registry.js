@@ -32,10 +32,33 @@ import {
 
 export const WORKER_STATES = ['PROVISIONING', 'IDLE', 'BUSY', 'DRAINING', 'TERMINATED'];
 
-// Worker rows outlive their usefulness only briefly; a TTL keeps a crashed
-// provision from leaking a row forever without the reconciler having to notice.
-// Generous relative to the 8h max lifetime so it never expires a live worker.
-const WORKER_TTL_SECONDS = 12 * 60 * 60;
+// AN EC2 WORKER ROW IS A LEASE. AN AGENTCORE ROW IS NOT.
+//
+// For an EC2 worker the expiry is not garbage collection — it is the liveness
+// signal. The worker holds its row by renewing the TTL on every heartbeat (30s from
+// its poll loop); when it stops renewing, the row expires and the worker is gone,
+// with nothing having to compare timestamps or run a sweep to notice. Five minutes
+// is ten missed beats: generous enough that a brief Valkey blip cannot evict a
+// healthy worker, tight enough that a dead one stops counting against maxInstances
+// within a stage's lifetime. A launch that never boots losing its row after five
+// minutes is not a false positive — the row is claiming a worker exists, and none
+// does.
+//
+// An AgentCore row is a PLACEMENT RECORD and carries NO EXPIRY AT ALL. Nothing ever
+// beats it: the scheduler writes it, and that session's liveness belongs to the
+// Bedrock AgentCore platform (see lambda/scheduler/provisioners.js). It is removed
+// by release, explicitly. Giving it a TTL — even a long one picked so it "never
+// fires in practice" — would be an expiry that means nothing, which is exactly what
+// the 12h WORKER_TTL_SECONDS this replaces was: a number nobody renewed, and
+// therefore a row whose disappearance carried no information and whose survival
+// carried none either.
+//
+// EXPIRY REMOVES A ROW, NEVER AN INSTANCE. Nothing here can call
+// TerminateInstances, so a runner that dies while its instance keeps running
+// leaves that instance to `reapOrphans`, which asks EC2 what exists rather than
+// trusting this registry. Valkey holds liveness; EC2 holds existence.
+const WORKER_LEASE_SECONDS = Number(process.env.WORKER_LEASE_SECONDS || 5 * 60);
+
 const JOB_TTL_SECONDS = 12 * 60 * 60;
 
 const nowMs = () => Date.now();
@@ -110,10 +133,13 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   const putWorker = async (worker) => {
     const key = workerMetaKey(worker.workerId);
     const flat = encodeWorker({ ...worker, lastSeenAtMs: clock() });
-    // Same hash tag, so these three land in one slot and can pipeline safely.
+    // Same hash tag, so these land in one slot and can pipeline safely.
     const pipeline = client.pipeline();
     pipeline.hset(key, flat);
-    pipeline.expire(key, WORKER_TTL_SECONDS);
+    // Only an EC2 row gets a lease, because only an EC2 worker beats to renew it.
+    // An AgentCore row is removed by release, not by expiry, so it gets no TTL —
+    // one that nothing renews would be a number, not a signal.
+    if (worker.kind === 'EC2') pipeline.expire(key, WORKER_LEASE_SECONDS);
     await pipeline.exec();
     // Different tag ({e:…}), so this is a separate round trip by necessity.
     await client.sadd(environmentWorkersKey(worker.environmentId), worker.workerId);
@@ -137,8 +163,25 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     return live;
   };
 
+  /**
+   * Move a row to a new state. Deliberately does NOT touch the expiry.
+   *
+   * Renewing here would let the scheduler hold a lease open on a worker's behalf —
+   * `markBusy` and the draining mark are both written by the scheduler — and a
+   * lease somebody else can renew is not a liveness claim by the worker. Only
+   * `heartbeat` renews.
+   *
+   * Guarded exactly as `heartbeat` is, though, and for the same reason: HSET CREATES
+   * the key it writes to, so a transition landing a moment after the lease expired
+   * would rebuild the row as a partial one — no kind, no instanceId, and no TTL at
+   * all, since only `putWorker` ever sets one. That row is immortal, and
+   * `listWorkers` would go on offering it to the placement strategy and counting it
+   * against maxInstances forever. So a missing row answers `null`: a worker that
+   * failed to hold its lease does not get it back by announcing a state change.
+   */
   const setWorkerState = async (workerId, state, patch = {}) => {
     const key = workerMetaKey(workerId);
+    if (!(await client.exists(key))) return null;
     const flat = { state, lastSeenAtMs: String(clock()) };
     for (const [field, value] of Object.entries(patch)) {
       flat[field] = value == null ? '' : String(value);
@@ -148,8 +191,12 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   };
 
   const markIdle = async (worker) => {
-    await setWorkerState(worker.workerId, 'IDLE', { currentJobId: '' });
+    const row = await setWorkerState(worker.workerId, 'IDLE', { currentJobId: '' });
+    // No row means the lease is gone. Adding the id to the idle index anyway would
+    // advertise a worker that does not exist.
+    if (!row) return null;
     await client.zadd(environmentIdleKey(worker.environmentId), clock(), worker.workerId);
+    return row;
   };
 
   const markBusy = async (worker, jobId) => {
@@ -166,14 +213,30 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     await pipeline.exec();
   };
 
+  /**
+   * Renew this worker's lease. THIS is what keeps its row alive.
+   *
+   * The EXPIRE is the point; lastSeenAtMs is written alongside for operators
+   * reading describe-fleet, and nothing decides liveness from it.
+   *
+   * Renewal is deliberately not a blind write. HSET on an absent key would
+   * resurrect an expired worker as a partial row carrying only a timestamp, which
+   * would then look alive to the placement strategy — a worker able to
+   * resurrect its own lease is not holding a lease at all. So a lost lease stays
+   * lost: `false` tells the runner it has been written off and must shut down
+   * rather than keep claiming jobs.
+   */
   const heartbeat = async (workerId) => {
-    // HSET on an absent key would resurrect a reaped worker as a partial row with
-    // only a timestamp, which the reconciler would then have to interpret. Beat
-    // only a worker that still exists; `false` is the runner's signal that it has
-    // been reaped and should shut itself down.
     const key = workerMetaKey(workerId);
-    if (!(await client.exists(key))) return false;
-    await client.hset(key, { lastSeenAtMs: String(clock()) });
+    const kind = await client.hget(key, 'kind');
+    if (kind === null) return false;
+    const pipeline = client.pipeline();
+    pipeline.hset(key, { lastSeenAtMs: String(clock()) });
+    // The lease, renewed. Read the row's own kind rather than trusting the caller:
+    // an AgentCore row must not acquire an expiry it has no beat to renew, and this
+    // is the only place a lease is ever extended.
+    if (kind === 'EC2') pipeline.expire(key, WORKER_LEASE_SECONDS);
+    await pipeline.exec();
     return true;
   };
 
@@ -305,5 +368,5 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   };
 };
 
-export { decodeWorker, encodeWorker, WORKER_TTL_SECONDS, JOB_TTL_SECONDS };
+export { decodeWorker, encodeWorker, WORKER_LEASE_SECONDS, JOB_TTL_SECONDS };
 export default { createRegistry, WORKER_STATES };
