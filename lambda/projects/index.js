@@ -21,6 +21,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import nodePath from 'node:path';
 import { buildResponse } from '../shared/response.js';
 import {
+  isDefaultableEnvironment,
   isEnvironmentResolutionError,
   resolvePublishedEnvironment,
 } from '../shared/environment-snapshot.js';
@@ -1008,6 +1009,14 @@ const handleProjectEnvironment = async (g, response, httpMethod, projectId, user
       const environmentId = String(data.environmentId || '').trim();
       if (!environmentId) return response(400, { error: 'environmentId is required' });
       const published = await readPublishedEnvironment(environmentId);
+      // The AGENTCORE-default invariant (see assertDefaultableEnvironment).
+      if (!isDefaultableEnvironment(published.environment)) {
+        return response(409, {
+          error:
+            'An EC2 environment cannot be a project default; bind it to individual stages instead',
+          code: 'ENVIRONMENT_KIND_NOT_DEFAULTABLE',
+        });
+      }
       const updatedAt = new Date().toISOString();
       await g
         .V()

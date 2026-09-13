@@ -638,13 +638,39 @@ const TRANSITIONS = {
   RETIRED: new Set(),
 };
 
-export const assertRevisionTransition = (from, to) => {
+// An EC2 revision runs the SAME lifecycle with two states removed. There is no
+// container image, so there is nothing for ECR to scan: SCANNING and
+// SECURITY_REVIEW never occur and BUILDING (which for EC2 means
+// CreateLaunchTemplate) goes straight to VERIFYING (launch a probe instance, run
+// the capability checks, terminate). Keeping one status vocabulary means the
+// registry UI, the GSI1 status index and the status poller need no special cases
+// — only the legal edges differ.
+const EC2_TRANSITIONS = {
+  DRAFT: new Set(['QUEUED', 'RETIRED']),
+  QUEUED: new Set(['BUILDING', 'FAILED']),
+  BUILDING: new Set(['VERIFYING', 'FAILED']),
+  SCANNING: new Set(),
+  SECURITY_REVIEW: new Set(),
+  VERIFYING: new Set(['READY', 'FAILED']),
+  READY: new Set(['PUBLISHED', 'QUEUED', 'RETIRED']),
+  PUBLISHED: new Set(['SUPERSEDED', 'RETIRED']),
+  SUPERSEDED: new Set(['RETIRED']),
+  FAILED: new Set(['QUEUED', 'RETIRED']),
+  RETIRED: new Set(),
+};
+
+export const ENVIRONMENT_KINDS = ['AGENTCORE', 'EC2'];
+export const DEFAULT_ENVIRONMENT_KIND = 'AGENTCORE';
+
+const transitionsFor = (kind) => (kind === 'EC2' ? EC2_TRANSITIONS : TRANSITIONS);
+
+export const assertRevisionTransition = (from, to, { kind = DEFAULT_ENVIRONMENT_KIND } = {}) => {
   if (!REVISION_STATUSES.includes(from) || !REVISION_STATUSES.includes(to)) {
     throw new Error(`Unknown revision status transition: ${from} -> ${to}`);
   }
   if (from === to) return;
-  if (!TRANSITIONS[from].has(to)) {
-    throw new Error(`Invalid revision status transition: ${from} -> ${to}`);
+  if (!transitionsFor(kind)[from].has(to)) {
+    throw new Error(`Invalid ${kind} revision status transition: ${from} -> ${to}`);
   }
 };
 

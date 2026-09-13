@@ -370,8 +370,37 @@ MANAGED_GO`,
     });
     expect(() => assertRevisionTransition('DRAFT', 'QUEUED')).not.toThrow();
     expect(() => assertRevisionTransition('FAILED', 'SECURITY_REVIEW')).not.toThrow();
+    // The message names the kind, because the legal edges differ per kind and
+    // "BUILDING -> PUBLISHED is invalid" is ambiguous once two maps exist.
     expect(() => assertRevisionTransition('BUILDING', 'PUBLISHED')).toThrow(
-      'Invalid revision status transition',
+      'Invalid AGENTCORE revision status transition',
     );
+  });
+
+  it('runs EC2 revisions through the same statuses minus image scanning', () => {
+    const ec2 = { kind: 'EC2' };
+    // An EC2 revision has no container image, so there is nothing to scan:
+    // BUILDING (CreateLaunchTemplate) goes straight to VERIFYING.
+    expect(() => assertRevisionTransition('BUILDING', 'VERIFYING', ec2)).not.toThrow();
+    expect(() => assertRevisionTransition('VERIFYING', 'READY', ec2)).not.toThrow();
+    expect(() => assertRevisionTransition('READY', 'PUBLISHED', ec2)).not.toThrow();
+    expect(() => assertRevisionTransition('PUBLISHED', 'SUPERSEDED', ec2)).not.toThrow();
+
+    // …and the scan states are unreachable rather than merely unused.
+    expect(() => assertRevisionTransition('BUILDING', 'SCANNING', ec2)).toThrow(
+      'Invalid EC2 revision status transition',
+    );
+    expect(() => assertRevisionTransition('SCANNING', 'VERIFYING', ec2)).toThrow(
+      'Invalid EC2 revision status transition',
+    );
+    // There is no security review to send a failed EC2 revision back to.
+    expect(() => assertRevisionTransition('FAILED', 'SECURITY_REVIEW', ec2)).toThrow(
+      'Invalid EC2 revision status transition',
+    );
+    expect(() => assertRevisionTransition('FAILED', 'QUEUED', ec2)).not.toThrow();
+  });
+
+  it('defaults to the AGENTCORE lifecycle when no kind is supplied', () => {
+    expect(() => assertRevisionTransition('SCANNING', 'SECURITY_REVIEW')).not.toThrow();
   });
 });

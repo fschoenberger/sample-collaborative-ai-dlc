@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import {
   CURRENT_RUNTIME_COMPATIBILITY_VERSION,
+  DEFAULT_ENVIRONMENT_KIND,
   SYSTEM_ENVIRONMENT_TEMPLATES,
   assertRevisionTransition,
   flattenRecipe,
@@ -43,6 +44,36 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
     recipe?.schemaVersion === CATALOG_RECIPE_SCHEMA_VERSION
       ? generateCatalogEnvironmentDockerfile(recipe)
       : generateDockerfile(flattenedRecipe);
+
+  // The build-artifact fields a revision carries differ by kind, and the kind is
+  // denormalized onto the revision so the status poller and the transition check
+  // never need a second read of the environment to know which lifecycle applies.
+  //   AGENTCORE — an image and an AgentCore runtime: imageUri/imageDigest,
+  //               runtimeArn/runtimeEndpoint, a generated Dockerfile.
+  //   EC2       — an opaque operator AMI and a platform-created launch template:
+  //               launchTemplateId/launchTemplateVersion. No Dockerfile, no image
+  //               digest, no size projection; toolchain evidence recorded by the
+  //               verify step lands in `verification`.
+  const revisionArtifactFields = ({ kind, recipe, flattenedRecipe, launchSpec }) =>
+    kind === 'EC2'
+      ? {
+          launchSpec,
+          launchTemplateId: null,
+          launchTemplateVersion: null,
+        }
+      : {
+          recipe,
+          flattenedRecipe,
+          imageUri: null,
+          imageDigest: null,
+          runtimeArn: null,
+          runtimeEndpoint: null,
+          generatedDockerfile: revisionDockerfile(recipe, flattenedRecipe),
+          projectedImageSizeBytes:
+            recipe?.schemaVersion === CATALOG_RECIPE_SCHEMA_VERSION
+              ? projectedEnvironmentImageSize(recipe)
+              : null,
+        };
 
   const getEnvironment = async (environmentId) => {
     const { Item } = await ddb.send(
@@ -112,6 +143,8 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
     flattenedRecipe = recipe,
     createdBy,
     system = false,
+    kind = DEFAULT_ENVIRONMENT_KIND,
+    launchSpec = null,
   }) => {
     const createdAt = now();
     const revisionId = `r-${nextId()}`;
@@ -124,8 +157,12 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
       name,
       description,
       system,
+      kind,
       status: 'DRAFT',
-      baseEnvironmentId,
+      // An EC2 environment has no base to inherit tools from — the AMI is the
+      // whole toolchain — so the field is null rather than pointing at `standard`
+      // and implying an inheritance that does not exist.
+      baseEnvironmentId: kind === 'EC2' ? null : baseEnvironmentId,
       currentRevisionId: revisionId,
       publishedRevisionId: null,
       updateAvailable: false,
@@ -141,21 +178,12 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
       environmentId,
       revisionId,
       status: 'DRAFT',
-      recipe,
-      flattenedRecipe,
+      kind,
       runtimeCompatibilityVersion: compatibilityVersion(),
       createdAt,
       createdBy,
       updatedAt: createdAt,
-      imageUri: null,
-      imageDigest: null,
-      runtimeArn: null,
-      runtimeEndpoint: null,
-      generatedDockerfile: revisionDockerfile(recipe, flattenedRecipe),
-      projectedImageSizeBytes:
-        recipe?.schemaVersion === CATALOG_RECIPE_SCHEMA_VERSION
-          ? projectedEnvironmentImageSize(recipe)
-          : null,
+      ...revisionArtifactFields({ kind, recipe, flattenedRecipe, launchSpec }),
       verification: null,
       scanFindings: null,
     };
@@ -186,12 +214,18 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
     environment,
     recipe,
     flattenedRecipe = recipe,
+    launchSpec = null,
     createdBy,
     reason = 'edited',
     clearUpdateAvailable = false,
   }) => {
     const createdAt = now();
     const revisionId = `r-${nextId()}`;
+    // The kind is a property of the ENVIRONMENT, never of an individual revision:
+    // an AGENTCORE environment cannot grow an EC2 revision or vice versa. Reading
+    // it off the environment (rather than accepting it as an argument) makes that
+    // structural rather than something a caller can get wrong.
+    const kind = environment.kind ?? DEFAULT_ENVIRONMENT_KIND;
     const revision = {
       ...revisionKey(environment.environmentId, revisionId),
       ...revisionStatusIndex('DRAFT', createdAt, environment.environmentId, revisionId),
@@ -199,22 +233,13 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
       environmentId: environment.environmentId,
       revisionId,
       status: 'DRAFT',
-      recipe,
-      flattenedRecipe,
+      kind,
       reason,
       runtimeCompatibilityVersion: compatibilityVersion(),
       createdAt,
       createdBy,
       updatedAt: createdAt,
-      imageUri: null,
-      imageDigest: null,
-      runtimeArn: null,
-      runtimeEndpoint: null,
-      generatedDockerfile: revisionDockerfile(recipe, flattenedRecipe),
-      projectedImageSizeBytes:
-        recipe?.schemaVersion === CATALOG_RECIPE_SCHEMA_VERSION
-          ? projectedEnvironmentImageSize(recipe)
-          : null,
+      ...revisionArtifactFields({ kind, recipe, flattenedRecipe, launchSpec }),
       verification: null,
       scanFindings: null,
     };
@@ -305,15 +330,24 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
   const updateRevision = async (environmentId, revisionId, patch, { fromStatus = null } = {}) => {
     const existing = await getRevision(environmentId, revisionId);
     if (!existing) throw new Error('Environment revision not found');
+    // A launch spec is as immutable after queuing as a recipe is: the launch
+    // template is built from it, and a published revision's launch identity must
+    // be frozen for any intent pinned to it.
     if (
       existing.status !== 'DRAFT' &&
-      (Object.hasOwn(patch, 'recipe') || Object.hasOwn(patch, 'flattenedRecipe'))
+      (Object.hasOwn(patch, 'recipe') ||
+        Object.hasOwn(patch, 'flattenedRecipe') ||
+        Object.hasOwn(patch, 'launchSpec'))
     ) {
       throw Object.assign(new Error('Environment revision recipes are immutable after queuing'), {
         statusCode: 409,
       });
     }
-    if (patch.status) assertRevisionTransition(existing.status, patch.status);
+    if (patch.status) {
+      assertRevisionTransition(existing.status, patch.status, {
+        kind: existing.kind ?? DEFAULT_ENVIRONMENT_KIND,
+      });
+    }
     const updatedAt = now();
     const nextStatus = patch.status ?? existing.status;
     const names = {};
@@ -327,6 +361,9 @@ export const createEnvironmentStore = ({ ddb, tableName, clock, ids } = {}) => {
       'status',
       'recipe',
       'flattenedRecipe',
+      'launchSpec',
+      'launchTemplateId',
+      'launchTemplateVersion',
       'buildId',
       'buildArn',
       'buildLogUrl',
