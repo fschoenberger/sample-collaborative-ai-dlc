@@ -1,6 +1,9 @@
 import { api } from './api';
 import type { AgentCli } from './projects';
 import type { AgentCredentialSource } from './agents';
+import type { EnvironmentKind } from './environments';
+import type { Ec2LaunchSpec } from '@/lib/ec2LaunchSpec';
+import type { StageEnvironmentOverride } from '@/lib/stageEnvironments';
 
 // AI-DLC v2 intents — the v2 unit of work (the v1 sprint analog). An intent
 // runs a compiled workflow's stages through dynamic phases. Process/runtime
@@ -36,9 +39,14 @@ export interface IntentSource {
   resourceUrl: string | null;
 }
 
+// The environment as it was when the run started — frozen, so republishing an
+// environment cannot move where an already-running intent places its work. The
+// AgentCore fields (image/runtime) and the EC2 fields (launch template + spec) are
+// mutually exclusive; `kind` says which set is populated.
 export interface IntentEnvironmentSnapshot {
   environmentId: string;
   name: string;
+  kind?: EnvironmentKind;
   revisionId: string;
   imageDigest: string | null;
   runtimeVersion: string | null;
@@ -46,6 +54,10 @@ export interface IntentEnvironmentSnapshot {
   runtimeEndpoint: string | null;
   compatibilityVersion: string;
   verification: Record<string, unknown> | null;
+  // EC2 only.
+  launchTemplateId?: string | null;
+  launchTemplateVersion?: string | null;
+  launchSpec?: Ec2LaunchSpec | null;
 }
 
 export interface IntentFailure {
@@ -85,6 +97,11 @@ export interface Intent {
   credentialSource?: AgentCredentialSource | null;
   cliModels: Record<string, string> | null;
   environment: IntentEnvironmentSnapshot | null;
+  // Per-stage placement, snapshotted at create: `{ [stageId]: snapshot }` for the
+  // stages bound somewhere other than the default. Keyed by STAGE id, not
+  // stage-instance id — every instance of a stage runs on the same kind of
+  // machine. Absent/null when every stage runs on the intent default.
+  stageEnvironments?: Record<string, IntentEnvironmentSnapshot> | null;
   parkReleaseSeconds: number | null;
   // WP5 (docs/v2-parallel.md): lane concurrency cap snapshotted at create
   // (0/null = unbounded) and the human's autonomy-ladder decision.
@@ -740,6 +757,10 @@ export interface CreateIntentInput {
   // Per-intent composed EXECUTE/SKIP grid — replaces the scope projection
   // (scope becomes a label). Validated server-side by the plan resolver.
   composedGrid?: Record<string, 'EXECUTE' | 'SKIP'>;
+  // Per-stage environment adjustments for THIS run, merged onto the project's
+  // map. A null/empty value REMOVES an inherited binding; omitting the field
+  // entirely inherits the project map unchanged.
+  stageEnvironments?: StageEnvironmentOverride;
   // Optional tracker provenance when seeded from a GitHub issue / Jira artifact.
   source?: {
     bindingId: string;

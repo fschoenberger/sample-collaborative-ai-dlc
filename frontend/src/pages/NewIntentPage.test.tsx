@@ -12,6 +12,24 @@ beforeEach(() => {
   window.HTMLElement.prototype.scrollIntoView = vi.fn();
 });
 
+// Placement defaults: nothing overridden by the space, which is the common case.
+// The per-run map is inherited from here, so every test needs it resolved.
+beforeEach(() => {
+  getProjectEnvironment.mockReset().mockResolvedValue({
+    environmentId: 'standard',
+    stageEnvironments: {},
+    environment: { environmentId: 'standard', name: 'Standard Node/Python' },
+    revision: null,
+  });
+  listEnvironments.mockReset().mockResolvedValue(ENVIRONMENTS);
+  getEnvironmentDetail.mockReset().mockResolvedValue({
+    environment: ENVIRONMENTS[1],
+    revisions: [],
+    publishedRevision: null,
+  });
+  listBlocks.mockReset().mockResolvedValue(STAGE_BLOCKS);
+});
+
 const useProjectCache = vi.fn();
 vi.mock('@/hooks/useProjectsCache', () => ({
   useProjectCache: (...a: unknown[]) => useProjectCache(...a),
@@ -31,7 +49,66 @@ vi.mock('@/services/sourceControl', () => ({
   },
 }));
 
+const getProjectEnvironment = vi.fn();
+vi.mock('@/services/projects', () => ({
+  projectsService: {
+    getEnvironment: (...a: unknown[]) => getProjectEnvironment(...a),
+  },
+}));
+
+const listEnvironments = vi.fn();
+const getEnvironmentDetail = vi.fn();
+vi.mock('@/services/environments', () => ({
+  environmentsService: {
+    list: (...a: unknown[]) => listEnvironments(...a),
+    get: (...a: unknown[]) => getEnvironmentDetail(...a),
+  },
+}));
+
+const listBlocks = vi.fn();
+vi.mock('@/services/blocks', () => ({
+  blocksService: { list: (...a: unknown[]) => listBlocks(...a) },
+}));
+
 import NewIntentPage from './NewIntentPage';
+
+const ENVIRONMENTS = [
+  {
+    environmentId: 'standard',
+    name: 'Standard Node/Python',
+    description: '',
+    system: true,
+    status: 'PUBLISHED',
+    kind: 'AGENTCORE',
+    baseEnvironmentId: null,
+    currentRevisionId: 'core-1',
+    publishedRevisionId: 'core-1',
+    updateAvailable: false,
+    createdAt: 'T',
+    updatedAt: 'T',
+  },
+  {
+    environmentId: 'gpu-fleet',
+    name: 'GPU Fleet',
+    description: '',
+    system: false,
+    status: 'PUBLISHED',
+    kind: 'EC2',
+    baseEnvironmentId: null,
+    currentRevisionId: 'r-ec2',
+    publishedRevisionId: 'r-ec2',
+    updateAvailable: false,
+    createdAt: 'T',
+    updatedAt: 'T',
+  },
+];
+
+const STAGE_BLOCKS = {
+  blocks: [
+    { blockId: 'build-and-test', name: 'Build and Test' },
+    { blockId: 'train-model', name: 'Train Model' },
+  ],
+};
 
 const baseProject = (over: Record<string, unknown> = {}) => ({
   id: 'p1',
@@ -183,5 +260,92 @@ describe('NewIntentPage — base branch selection', () => {
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     const payload = create.mock.calls[0][1];
     expect(payload.baseBranches).toEqual({ 'owner/repo': 'develop' });
+  });
+});
+
+describe('NewIntentPage — per-run stage placement', () => {
+  beforeEach(() => {
+    create.mockReset().mockResolvedValue({ id: 'i1' });
+    listBranches
+      .mockReset()
+      .mockResolvedValue({ branches: ['main', 'develop'], defaultBranch: 'main' });
+    useProjectCache.mockReset();
+    useProjectCache.mockReturnValue({ project: baseProject({ repos: [] }), loading: false });
+  });
+
+  it('says every stage runs on the space default when nothing is inherited', async () => {
+    renderPage();
+    expect(await screen.findByText('(every stage on Standard Node/Python)')).toBeInTheDocument();
+    // The environment list and stage catalogue are only needed to EDIT the map.
+    expect(listEnvironments).not.toHaveBeenCalled();
+    expect(listBlocks).not.toHaveBeenCalled();
+  });
+
+  it('marks inherited rows as inherited and does not send them again', async () => {
+    const user = userEvent.setup();
+    getProjectEnvironment.mockResolvedValue({
+      environmentId: 'standard',
+      stageEnvironments: { 'train-model': 'gpu-fleet' },
+      environment: { environmentId: 'standard', name: 'Standard Node/Python' },
+      revision: null,
+    });
+    renderPage();
+    expect(await screen.findByText('(1 stage bound elsewhere)')).toBeInTheDocument();
+    await user.click(screen.getByText('Where stages run'));
+    expect(await screen.findByText('Inherited')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('Prompt'), 'Build X');
+    const submit = screen.getByRole('button', { name: /continue to compose/i });
+    await waitFor(() => expect(submit).toBeEnabled());
+    await user.click(submit);
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    // An untouched run inherits: only the DELTA travels, and there is none.
+    expect(create.mock.calls[0][1].stageEnvironments).toBeUndefined();
+  });
+
+  it('sends an override for this run only', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByText('Where stages run'));
+    await waitFor(() => expect(listBlocks).toHaveBeenCalled());
+
+    await user.click(await screen.findByRole('combobox', { name: 'Stage' }));
+    await user.click(await screen.findByRole('option', { name: /Train Model/ }));
+
+    await user.click(await screen.findByRole('combobox', { name: 'Environment for Train Model' }));
+    await user.click(await screen.findByRole('option', { name: /GPU Fleet/ }));
+    expect(await screen.findByText('Overridden for this run')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('Prompt'), 'Build X');
+    const submit = screen.getByRole('button', { name: /continue to compose/i });
+    await waitFor(() => expect(submit).toBeEnabled());
+    await user.click(submit);
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][1].stageEnvironments).toEqual({ 'train-model': 'gpu-fleet' });
+  });
+
+  it('sends null to drop an inherited row for this run', async () => {
+    const user = userEvent.setup();
+    getProjectEnvironment.mockResolvedValue({
+      environmentId: 'standard',
+      stageEnvironments: { 'train-model': 'gpu-fleet' },
+      environment: { environmentId: 'standard', name: 'Standard Node/Python' },
+      revision: null,
+    });
+    renderPage();
+    await user.click(await screen.findByText('Where stages run'));
+    await user.click(
+      await screen.findByRole('button', { name: 'Remove override for Train Model' }),
+    );
+    // The row stays, so the clearing is visible and reversible.
+    expect(await screen.findByText('Cleared for this run')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Restore Train Model' })).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('Prompt'), 'Build X');
+    const submit = screen.getByRole('button', { name: /continue to compose/i });
+    await waitFor(() => expect(submit).toBeEnabled());
+    await user.click(submit);
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][1].stageEnvironments).toEqual({ 'train-model': null });
   });
 });

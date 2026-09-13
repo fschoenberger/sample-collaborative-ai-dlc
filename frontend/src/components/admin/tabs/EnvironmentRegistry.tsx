@@ -30,6 +30,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { SettingsCard } from '@/components/settings/SettingsCard';
+import { environmentKindOf, type EnvironmentKind } from '@/lib/environmentKind';
 import {
   environmentsService,
   toolsService,
@@ -42,12 +43,26 @@ import {
   type ManagedTool,
   type ManagedToolVersion,
 } from '@/services/environments';
+import { fieldErrorsFrom, validateEc2LaunchSpecInput, type FieldError } from '@/lib/ec2LaunchSpec';
+import {
+  Ec2LaunchSpecEditor,
+  Ec2LaunchSpecSummary,
+  emptyEc2Form,
+  launchSpecFromForm,
+  type Ec2FormState,
+} from './Ec2LaunchSpecEditor';
 import { cn } from '@/lib/utils';
 
 const ACTIVE_REVISION_STATUSES = new Set(['QUEUED', 'BUILDING', 'SCANNING', 'VERIFYING']);
 const RUNTIME_IMAGE_LIMIT_BYTES = 2048 * 1024 * 1024;
 
+const KIND_LABELS: Record<EnvironmentKind, string> = {
+  AGENTCORE: 'AgentCore runtime',
+  EC2: 'EC2 instance',
+};
+
 interface EnvironmentForm {
+  kind: EnvironmentKind;
   environmentId: string;
   name: string;
   description: string;
@@ -56,9 +71,11 @@ interface EnvironmentForm {
   aptPackages: string;
   environmentVariables: string;
   buildCommands: string;
+  launchSpec: Ec2FormState;
 }
 
 const emptyForm = (): EnvironmentForm => ({
+  kind: 'AGENTCORE',
   environmentId: '',
   name: '',
   description: '',
@@ -67,6 +84,7 @@ const emptyForm = (): EnvironmentForm => ({
   aptPackages: '',
   environmentVariables: '',
   buildCommands: '',
+  launchSpec: emptyEc2Form(),
 });
 
 const isCatalogRecipe = (
@@ -97,11 +115,16 @@ const formFromRevision = (
 ): EnvironmentForm => {
   const recipe = revision?.recipe;
   return {
+    kind: environmentKindOf(environment),
+    launchSpec: emptyEc2Form(),
     environmentId: environment.environmentId,
     name: environment.name,
     description: environment.description ?? '',
+    // Empty for `standard` (it follows the protected core runtime) and for EC2
+    // (an AMI is the whole toolchain — there is nothing to inherit), which is
+    // also what keeps the base-revision fetch from firing for either.
     baseEnvironmentId:
-      environment.environmentId === 'standard'
+      environment.environmentId === 'standard' || environmentKindOf(environment) === 'EC2'
         ? ''
         : (recipe?.base?.environmentId ?? environment.baseEnvironmentId ?? 'standard'),
     toolVersionIds: directToolVersionIds(revision),
@@ -677,6 +700,10 @@ export function EnvironmentRegistry() {
   const [baseLoading, setBaseLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Launch-spec complaints, from client-side validation or from the server's
+  // `errors: [{ field, message }]`. Both land in the same place so a field shows
+  // one message wherever the rejection came from.
+  const [specErrors, setSpecErrors] = useState<FieldError[]>([]);
 
   const loadList = useCallback(async (preferredId?: string) => {
     const values = await environmentsService.list();
@@ -765,7 +792,12 @@ export function EnvironmentRegistry() {
     detail?.revisions.find(
       (revision) => revision.revisionId === detail.environment.currentRevisionId,
     ) ?? null;
+  // An EC2 environment has no recipe at all, so it must be excluded before the
+  // legacy check — otherwise "no catalog recipe" reads as "unrebuildable
+  // fixed-tool recipe" and the whole pane goes read-only for the wrong reason.
+  const ec2Environment = environmentKindOf(detail?.environment) === 'EC2';
   const fixedToolEnvironment =
+    !ec2Environment &&
     detail?.environment.environmentId !== 'standard' &&
     Boolean(currentRevision) &&
     !isCatalogRecipe(currentRevision?.recipe);
@@ -784,6 +816,9 @@ export function EnvironmentRegistry() {
     (environment) =>
       environment.publishedRevisionId &&
       environment.status !== 'RETIRED' &&
+      // An EC2 environment is an opaque AMI: there is no image to layer tools
+      // onto, so it can never be a base.
+      environmentKindOf(environment) !== 'EC2' &&
       (creating || environment.environmentId !== selectedId),
   );
   const updates = environments.filter((environment) => environment.updateAvailable);
@@ -810,21 +845,42 @@ export function EnvironmentRegistry() {
   };
 
   const createEnvironment = async () => {
+    const identity = {
+      ...(form.environmentId.trim() ? { environmentId: form.environmentId.trim() } : {}),
+      name: form.name.trim(),
+      description: form.description.trim(),
+    };
+    // An EC2 spec is checked here first: the same rules the lambda applies, so a
+    // malformed AMI id or an out-of-range bound is a field message rather than a
+    // round trip.
+    const launchSpec = form.kind === 'EC2' ? launchSpecFromForm(form.launchSpec) : null;
+    if (launchSpec) {
+      const invalid = validateEc2LaunchSpecInput(launchSpec);
+      setSpecErrors(invalid);
+      if (invalid.length > 0) {
+        setError('Invalid launch spec');
+        return;
+      }
+    }
     setBusy('create');
     setError(null);
+    setSpecErrors([]);
     try {
-      const result = await environmentsService.create({
-        ...(form.environmentId.trim() ? { environmentId: form.environmentId.trim() } : {}),
-        name: form.name.trim(),
-        description: form.description.trim(),
-        baseEnvironmentId: form.baseEnvironmentId,
-        recipe: recipeFromForm(form),
-      });
+      const result = await environmentsService.create(
+        launchSpec
+          ? { ...identity, kind: 'EC2', launchSpec }
+          : {
+              ...identity,
+              baseEnvironmentId: form.baseEnvironmentId,
+              recipe: recipeFromForm(form),
+            },
+      );
       setCreating(false);
       setSelectedId(result.environment.environmentId);
       await loadList(result.environment.environmentId);
       await loadDetail(result.environment.environmentId);
     } catch (reason) {
+      setSpecErrors(fieldErrorsFrom(reason));
       setError(reason instanceof Error ? reason.message : 'Environment action failed');
     } finally {
       setBusy(null);
@@ -857,7 +913,7 @@ export function EnvironmentRegistry() {
           </Badge>
         ) : null
       }
-      description="Compose published tools into versioned AgentCore runtimes."
+      description="Compose published tools into versioned AgentCore runtimes, or bring an AMI and run stages on EC2."
       headerAction={
         <Button
           size="sm"
@@ -868,6 +924,7 @@ export function EnvironmentRegistry() {
             setDetail(null);
             setForm(emptyForm());
             setError(null);
+            setSpecErrors([]);
           }}
         >
           <Plus className="h-3.5 w-3.5" />
@@ -920,26 +977,118 @@ export function EnvironmentRegistry() {
                     Cancel
                   </Button>
                 </div>
-                <RecipeEditor
-                  form={form}
-                  onChange={setForm}
-                  baseOptions={baseOptions}
-                  baseEnvironment={baseEnvironment}
-                  baseRevision={baseRevision}
-                  baseLoading={baseLoading}
-                  tools={tools}
-                  disabled={Boolean(busy)}
-                  showId
-                />
+                <div className="space-y-2">
+                  <Label htmlFor="environment-kind" className="text-xs">
+                    Runs on
+                  </Label>
+                  <Select
+                    value={form.kind}
+                    disabled={Boolean(busy)}
+                    onValueChange={(value) => {
+                      const kind = value as EnvironmentKind;
+                      setSpecErrors([]);
+                      setError(null);
+                      setForm((current) => ({
+                        ...current,
+                        kind,
+                        // An EC2 environment has no base to inherit tools from,
+                        // and clearing it is what stops the base-revision fetch.
+                        baseEnvironmentId: kind === 'EC2' ? '' : 'standard',
+                        toolVersionIds: kind === 'EC2' ? [] : current.toolVersionIds,
+                      }));
+                    }}
+                  >
+                    <SelectTrigger
+                      id="environment-kind"
+                      aria-label="Runs on"
+                      className="h-9 text-sm"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="AGENTCORE">{KIND_LABELS.AGENTCORE}</SelectItem>
+                      <SelectItem value="EC2">{KIND_LABELS.EC2}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] text-muted-foreground">
+                    {form.kind === 'EC2'
+                      ? 'You bring an AMI and a machine shape. Nothing is built, and an EC2 environment can only be bound to individual stages — never as a space default.'
+                      : 'Catalog tools are composed onto a protected base and built into a runtime image.'}
+                  </p>
+                </div>
+                {form.kind === 'EC2' ? (
+                  <>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="ec2-environment-id" className="text-xs">
+                          ID
+                        </Label>
+                        <Input
+                          id="ec2-environment-id"
+                          value={form.environmentId}
+                          onChange={(event) =>
+                            setForm({ ...form, environmentId: event.target.value })
+                          }
+                          placeholder="generated-from-name"
+                          disabled={Boolean(busy)}
+                          className="h-9 font-mono text-sm"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="ec2-environment-name" className="text-xs">
+                          Name
+                        </Label>
+                        <Input
+                          id="ec2-environment-name"
+                          value={form.name}
+                          onChange={(event) => setForm({ ...form, name: event.target.value })}
+                          disabled={Boolean(busy)}
+                          className="h-9 text-sm"
+                        />
+                      </div>
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <Label htmlFor="ec2-environment-description" className="text-xs">
+                          Description
+                        </Label>
+                        <Input
+                          id="ec2-environment-description"
+                          value={form.description}
+                          onChange={(event) =>
+                            setForm({ ...form, description: event.target.value })
+                          }
+                          disabled={Boolean(busy)}
+                          className="h-9 text-sm"
+                        />
+                      </div>
+                    </div>
+                    <Ec2LaunchSpecEditor
+                      form={form.launchSpec}
+                      onChange={(launchSpec) => setForm({ ...form, launchSpec })}
+                      errors={specErrors}
+                      disabled={Boolean(busy)}
+                    />
+                  </>
+                ) : (
+                  <RecipeEditor
+                    form={form}
+                    onChange={setForm}
+                    baseOptions={baseOptions}
+                    baseEnvironment={baseEnvironment}
+                    baseRevision={baseRevision}
+                    baseLoading={baseLoading}
+                    tools={tools}
+                    disabled={Boolean(busy)}
+                    showId
+                  />
+                )}
                 <Button
                   size="sm"
                   className="gap-1.5"
                   disabled={
                     Boolean(busy) ||
-                    baseLoading ||
-                    !baseRevision ||
                     !form.name.trim() ||
-                    !form.baseEnvironmentId
+                    (form.kind === 'AGENTCORE' &&
+                      (baseLoading || !baseRevision || !form.baseEnvironmentId))
                   }
                   onClick={() => void createEnvironment()}
                 >
@@ -960,10 +1109,19 @@ export function EnvironmentRegistry() {
                     <div className="flex flex-wrap items-center gap-2">
                       <h3 className="text-sm font-semibold">{environment.name}</h3>
                       <StatusBadge status={environment.status} />
+                      <Badge variant="secondary" className="text-[10px]">
+                        {KIND_LABELS[environmentKindOf(environment)]}
+                      </Badge>
                     </div>
                     <p className="mt-1 font-mono text-[11px] text-muted-foreground">
                       {environment.environmentId}
                     </p>
+                    {ec2Environment && (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Bind this to individual stages in a space's Environment settings — an EC2
+                        environment cannot be a space default.
+                      </p>
+                    )}
                     {(environment.toolUpdates?.length ?? 0) > 0 && (
                       <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
                         Recommended tool updates are available. Save a new revision to select them.
@@ -977,7 +1135,8 @@ export function EnvironmentRegistry() {
                     )}
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {environment.updateAvailable &&
+                    {!ec2Environment &&
+                      environment.updateAvailable &&
                       environment.baseEnvironmentId &&
                       !(environment.toolUpdates?.length ?? 0) && (
                         <Button
@@ -1111,7 +1270,8 @@ export function EnvironmentRegistry() {
                       </Badge>
                     )}
                     {selectedRevision?.status === 'READY' &&
-                      (environment.environmentId === 'standard' ||
+                      (ec2Environment ||
+                        environment.environmentId === 'standard' ||
                         isCatalogRecipe(selectedRevision.recipe)) && (
                         <Button
                           size="sm"
@@ -1131,45 +1291,96 @@ export function EnvironmentRegistry() {
                   </div>
                 </div>
 
-                {environment.environmentId !== 'standard' && !fixedToolEnvironment && (
-                  <>
-                    <RecipeEditor
-                      form={form}
-                      onChange={setForm}
-                      baseOptions={baseOptions}
-                      baseEnvironment={baseEnvironment}
-                      baseRevision={baseRevision}
-                      baseLoading={baseLoading}
-                      tools={tools}
-                      disabled={Boolean(busy)}
-                      showId={false}
-                    />
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="gap-1.5"
-                      disabled={Boolean(busy) || baseLoading || !baseRevision || !form.name.trim()}
-                      onClick={() =>
-                        void run('save', () =>
-                          environmentsService.update(environment.environmentId, {
-                            name: form.name.trim(),
-                            description: form.description.trim(),
-                            baseEnvironmentId: form.baseEnvironmentId,
-                            recipe: recipeFromForm(form),
-                          }),
-                        )
-                      }
-                    >
-                      {busy === 'save' ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Save className="h-3.5 w-3.5" />
-                      )}
-                      Save as New Revision
-                    </Button>
-                  </>
-                )}
-                {selectedRevision && <Evidence revision={selectedRevision} />}
+                {environment.environmentId !== 'standard' &&
+                  !fixedToolEnvironment &&
+                  !ec2Environment && (
+                    <>
+                      <RecipeEditor
+                        form={form}
+                        onChange={setForm}
+                        baseOptions={baseOptions}
+                        baseEnvironment={baseEnvironment}
+                        baseRevision={baseRevision}
+                        baseLoading={baseLoading}
+                        tools={tools}
+                        disabled={Boolean(busy)}
+                        showId={false}
+                      />
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="gap-1.5"
+                        disabled={
+                          Boolean(busy) || baseLoading || !baseRevision || !form.name.trim()
+                        }
+                        onClick={() =>
+                          void run('save', () =>
+                            environmentsService.update(environment.environmentId, {
+                              name: form.name.trim(),
+                              description: form.description.trim(),
+                              baseEnvironmentId: form.baseEnvironmentId,
+                              recipe: recipeFromForm(form),
+                            }),
+                          )
+                        }
+                      >
+                        {busy === 'save' ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Save className="h-3.5 w-3.5" />
+                        )}
+                        Save as New Revision
+                      </Button>
+                    </>
+                  )}
+                {/* An EC2 revision has no build, no scan and no image, so the
+                    build-evidence panel has nothing to say about it — the launch
+                    spec and the launch template it produced are the evidence. */}
+                {selectedRevision && ec2Environment ? (
+                  <div className="space-y-4 border-t pt-4">
+                    <h4 className="text-xs font-medium">Launch spec</h4>
+                    {selectedRevision.launchSpec ? (
+                      <Ec2LaunchSpecSummary spec={selectedRevision.launchSpec} />
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground">
+                        No launch spec recorded on this revision.
+                      </p>
+                    )}
+                    <dl className="grid gap-2 text-[11px] sm:grid-cols-2">
+                      <div>
+                        <dt className="text-muted-foreground">Launch template</dt>
+                        <dd className="break-all font-mono">
+                          {selectedRevision.launchTemplateId
+                            ? `${selectedRevision.launchTemplateId} · v${selectedRevision.launchTemplateVersion ?? '?'}`
+                            : 'Not created'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Compatibility</dt>
+                        <dd className="font-mono">
+                          {selectedRevision.runtimeCompatibilityVersion}
+                        </dd>
+                      </div>
+                    </dl>
+                    {selectedRevision.failure && (
+                      <div className="border-l-2 border-destructive/60 pl-3 text-xs text-destructive">
+                        <div className="font-medium">
+                          {selectedRevision.failure.reason ?? 'Image unusable'}
+                        </div>
+                        {selectedRevision.failure.detail && (
+                          <div className="mt-1">{selectedRevision.failure.detail}</div>
+                        )}
+                        {fieldErrorsFrom({ body: selectedRevision.failure }).map((entry) => (
+                          <div key={`${entry.field}-${entry.message}`} className="mt-1">
+                            {entry.message}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : selectedRevision ? (
+                  <Evidence revision={selectedRevision} />
+                ) : null}
               </>
             )}
             {error && <p className="text-xs text-destructive">{error}</p>}

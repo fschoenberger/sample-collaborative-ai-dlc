@@ -1,4 +1,11 @@
 import { api } from './api';
+import type { Ec2LaunchSpec, Ec2LaunchSpecInput } from '@/lib/ec2LaunchSpec';
+import type { StageEnvironmentMap } from '@/lib/stageEnvironments';
+// `kind` and the AGENTCORE-default rule live in lib/environmentKind so components
+// and their tests can use them without going through this service.
+import type { EnvironmentKind } from '@/lib/environmentKind';
+
+export type { EnvironmentKind };
 
 export type EnvironmentStatus =
   | 'DRAFT'
@@ -115,6 +122,9 @@ export interface ManagedEnvironment {
   description: string;
   system: boolean;
   status: EnvironmentStatus;
+  // Absent on environments created before EC2 support; treat as AGENTCORE via
+  // environmentKindOf rather than reading it raw.
+  kind?: EnvironmentKind;
   baseEnvironmentId: string | null;
   currentRevisionId: string;
   publishedRevisionId: string | null;
@@ -133,16 +143,24 @@ export interface EnvironmentRevision {
   revisionId: string;
   status: EnvironmentRevisionStatus;
   reason?: string;
-  recipe: EnvironmentRecipe;
-  flattenedRecipe: EnvironmentRecipe;
+  // Denormalized from the environment so the lifecycle a revision follows can be
+  // read without a second lookup. The artifact fields below split by it: an
+  // AGENTCORE revision carries a recipe and an image, an EC2 revision a launch
+  // spec and the launch template built around it.
+  kind?: EnvironmentKind;
+  recipe?: EnvironmentRecipe;
+  flattenedRecipe?: EnvironmentRecipe;
+  launchSpec?: Ec2LaunchSpec | null;
+  launchTemplateId?: string | null;
+  launchTemplateVersion?: string | null;
   runtimeCompatibilityVersion: string;
-  imageUri: string | null;
-  imageDigest: string | null;
+  imageUri?: string | null;
+  imageDigest?: string | null;
   imageSizeBytes?: number | null;
   projectedImageSizeBytes?: number | null;
-  runtimeArn: string | null;
+  runtimeArn?: string | null;
   runtimeVersion?: string | null;
-  runtimeEndpoint: string | null;
+  runtimeEndpoint?: string | null;
   generatedDockerfile?: string | null;
   buildId?: string | null;
   buildLogUrl?: string | null;
@@ -160,6 +178,10 @@ export interface EnvironmentRevision {
     reason?: string;
     detail?: string | null;
     failedAt?: string;
+    // An unusable AMI fails an EC2 revision with `code: 'IMAGE_UNUSABLE'` and the
+    // per-field reasons DescribeImages disagreed on, rather than a build log.
+    code?: string;
+    errors?: { field: string; message: string }[];
   } | null;
   highFindingsAcknowledgedAt?: string | null;
   highFindingsAcknowledgedBy?: string | null;
@@ -279,6 +301,9 @@ export interface ToolMutationResult {
 
 export interface ProjectEnvironmentAssignment {
   environmentId: string;
+  // Per-stage overrides, `{ [stageId]: environmentId }`. Absent from very old
+  // responses; an empty map means "everything runs on the default".
+  stageEnvironments?: StageEnvironmentMap;
   environment: ManagedEnvironment | null;
   revision: EnvironmentRevision | null;
   updatedAt?: string;
@@ -293,13 +318,27 @@ export const environmentsService = {
   list: (publishedOnly = false) =>
     api.get<ManagedEnvironment[]>(`/environments${publishedOnly ? '?published=true' : ''}`),
   get: (environmentId: string) => api.get<EnvironmentDetail>(environmentPath(environmentId)),
-  create: (input: {
-    environmentId?: string;
-    name: string;
-    description?: string;
-    baseEnvironmentId: string;
-    recipe: EnvironmentRecipeInput;
-  }) => api.post<EnvironmentMutationResult>('/environments', input),
+  // Two shapes, discriminated by `kind`: an AGENTCORE environment names a base
+  // and a catalog recipe, an EC2 one a launch spec. `kind` is omitted for
+  // AGENTCORE so the request stays byte-identical to what the server already
+  // accepted before EC2 existed.
+  create: (
+    input:
+      | {
+          environmentId?: string;
+          name: string;
+          description?: string;
+          baseEnvironmentId: string;
+          recipe: EnvironmentRecipeInput;
+        }
+      | {
+          environmentId?: string;
+          name: string;
+          description?: string;
+          kind: 'EC2';
+          launchSpec: Ec2LaunchSpecInput;
+        },
+  ) => api.post<EnvironmentMutationResult>('/environments', input),
   update: (
     environmentId: string,
     input: {

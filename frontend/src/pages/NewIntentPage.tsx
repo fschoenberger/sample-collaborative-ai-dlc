@@ -3,8 +3,21 @@ import { useParams, useNavigate } from 'react-router';
 import { useProjectCache } from '@/hooks/useProjectsCache';
 import { intentsService } from '@/services/intents';
 import { trackersService, type TrackerIssue } from '@/services/trackers';
-import type { TrackerBinding } from '@/services/projects';
+import { projectsService, type TrackerBinding } from '@/services/projects';
+import { environmentsService, type ManagedEnvironment } from '@/services/environments';
+import { environmentKindOf } from '@/lib/environmentKind';
+import { blocksService } from '@/services/blocks';
 import { sourceControlService } from '@/services/sourceControl';
+import {
+  StageEnvironmentOverrides,
+  type StageOption,
+} from '@/components/project-settings/StageEnvironmentOverrides';
+import {
+  requiresComputeOf,
+  stageEnvironmentDelta,
+  type StageEnvironmentMap,
+} from '@/lib/stageEnvironments';
+import type { Ec2LaunchSpec } from '@/lib/ec2LaunchSpec';
 import { buildSprintDescription } from '@/lib/buildSprintDescription';
 import { formatTrackerSourceLabel } from '@/lib/trackerSourceLabel';
 import { IntentSourcePicker } from '@/components/IntentSourcePicker';
@@ -54,8 +67,98 @@ export default function NewIntentPage() {
   const [branchLoading, setBranchLoading] = useState<Record<string, boolean>>({});
   const [branchLoadError, setBranchLoadError] = useState<Record<string, string>>({});
 
+  // Where stages run. The space holds a default plus a per-stage map; this run may
+  // adjust the map, and intent creation snapshots the result. The map is fetched
+  // eagerly (one request) so the collapsed header can say whether anything is
+  // inherited at all; the environment list and stage catalogue — needed only to
+  // EDIT it — wait until the section is opened.
+  const [showEnvironments, setShowEnvironments] = useState(false);
+  const [defaultEnvironmentName, setDefaultEnvironmentName] = useState<string | null>(null);
+  const [inheritedStageEnvironments, setInheritedStageEnvironments] = useState<StageEnvironmentMap>(
+    {},
+  );
+  const [stageEnvironments, setStageEnvironments] = useState<StageEnvironmentMap>({});
+  const [environments, setEnvironments] = useState<ManagedEnvironment[]>([]);
+  const [stages, setStages] = useState<StageOption[]>([]);
+  const [launchSpecs, setLaunchSpecs] = useState<Record<string, Ec2LaunchSpec | null>>({});
+  const [environmentsLoading, setEnvironmentsLoading] = useState(false);
+
   const hasTrackers = (project?.trackers.length ?? 0) > 0;
   const repos = project?.repos ?? [];
+
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+    projectsService
+      .getEnvironment(projectId)
+      .then((assignment) => {
+        if (!active) return;
+        setDefaultEnvironmentName(assignment.environment?.name ?? assignment.environmentId);
+        setInheritedStageEnvironments(assignment.stageEnvironments ?? {});
+        setStageEnvironments(assignment.stageEnvironments ?? {});
+      })
+      .catch(() => {
+        // Placement is optional at create: a run with no adjustments is the
+        // common case, so a failure here must not block the draft.
+      });
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!showEnvironments || environments.length > 0 || environmentsLoading) return;
+    setEnvironmentsLoading(true);
+    Promise.all([
+      environmentsService.list(true),
+      blocksService.list('stage').catch(() => ({ blocks: [] })),
+    ])
+      .then(([available, stageBlocks]) => {
+        setEnvironments(available);
+        setStages(
+          (stageBlocks.blocks ?? [])
+            .map((block) => ({
+              stageId: block.blockId,
+              name: block.name || block.blockId,
+              requiresCompute: requiresComputeOf(block.requiresCompute),
+            }))
+            .toSorted((a, b) => a.name.localeCompare(b.name)),
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => setEnvironmentsLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- environments/loading read for dedupe only
+  }, [showEnvironments]);
+
+  // Launch specs for the EC2 environments this run binds, for the advisory only.
+  useEffect(() => {
+    const ec2Ids = [...new Set(Object.values(stageEnvironments))].filter(
+      (environmentId) =>
+        environmentKindOf(environments.find((item) => item.environmentId === environmentId)) ===
+        'EC2',
+    );
+    let active = true;
+    for (const environmentId of ec2Ids) {
+      if (environmentId in launchSpecs) continue;
+      void environmentsService
+        .get(environmentId)
+        .then((value) => {
+          if (active) {
+            setLaunchSpecs((current) => ({
+              ...current,
+              [environmentId]: value.publishedRevision?.launchSpec ?? null,
+            }));
+          }
+        })
+        .catch(() => {
+          if (active) setLaunchSpecs((current) => ({ ...current, [environmentId]: null }));
+        });
+    }
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- launchSpecs read for dedupe only
+  }, [environments, stageEnvironments]);
 
   // Lazily fetch each repo's branch list (+ its actual default branch) the
   // first time the base-branch picker is expanded — most intents never open
@@ -119,12 +222,17 @@ export default function NewIntentPage() {
       const baseBranches = Object.fromEntries(
         Object.entries(baseBranchSelections).filter(([, branch]) => branch),
       );
+      // Only the DELTA against the space's map travels: an untouched run sends
+      // nothing and inherits, and a stage this run took back to the default
+      // travels as an explicit null (which is how the server removes it).
+      const stageDelta = stageEnvironmentDelta(inheritedStageEnvironments, stageEnvironments);
       // Scope is deliberately omitted — the server defaults it and the compose
       // page is where the projection is actually chosen (collaboratively).
       const intent = await intentsService.create(projectId, {
         title: title.trim(),
         prompt: prompt.trim(),
         baseBranches: Object.keys(baseBranches).length ? baseBranches : undefined,
+        stageEnvironments: Object.keys(stageDelta).length ? stageDelta : undefined,
         source: source
           ? {
               bindingId: source.binding.id,
@@ -141,6 +249,11 @@ export default function NewIntentPage() {
       setCreating(false);
     }
   };
+
+  const overrideCount = Object.keys(inheritedStageEnvironments).length;
+  const stageChanges = Object.keys(
+    stageEnvironmentDelta(inheritedStageEnvironments, stageEnvironments),
+  ).length;
 
   if (projectLoading) {
     return (
@@ -339,6 +452,52 @@ export default function NewIntentPage() {
                 )}
               </div>
             )}
+
+            <div className="border rounded-md">
+              <button
+                type="button"
+                onClick={() => setShowEnvironments((v) => !v)}
+                className="w-full flex items-center gap-1.5 px-3 py-2 text-sm font-medium"
+              >
+                {showEnvironments ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                Where stages run
+                <span className="text-xs text-muted-foreground font-normal">
+                  {overrideCount === 0
+                    ? `(every stage on ${defaultEnvironmentName ?? 'the space default'})`
+                    : `(${overrideCount} stage${overrideCount === 1 ? '' : 's'} bound elsewhere)`}
+                </span>
+                {stageChanges > 0 && (
+                  <Badge variant="secondary" className="ml-auto text-[10px]">
+                    {stageChanges} change{stageChanges === 1 ? '' : 's'} for this run
+                  </Badge>
+                )}
+              </button>
+              {showEnvironments && (
+                <div className="px-3 pb-3 space-y-3">
+                  <p className="text-[11px] text-muted-foreground">
+                    Rows come from the space's settings. Changes here apply to this run only and are
+                    snapshotted when the intent is created.
+                  </p>
+                  {environmentsLoading ? (
+                    <Skeleton className="h-24" />
+                  ) : (
+                    <StageEnvironmentOverrides
+                      stages={stages}
+                      environments={environments}
+                      launchSpecs={launchSpecs}
+                      value={stageEnvironments}
+                      onChange={setStageEnvironments}
+                      inherited={inheritedStageEnvironments}
+                      disabled={creating}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
 
             <div className="flex items-center gap-3 pt-2">
               <Button

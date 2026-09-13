@@ -17,13 +17,31 @@ import {
   type ManagedEnvironment,
   type ProjectEnvironmentAssignment,
 } from '@/services/environments';
+import { environmentKindOf, isDefaultableEnvironment } from '@/lib/environmentKind';
+import { blocksService } from '@/services/blocks';
 import { projectsService, type Project } from '@/services/projects';
+import {
+  StageEnvironmentOverrides,
+  type StageOption,
+} from '@/components/project-settings/StageEnvironmentOverrides';
+import {
+  requiresComputeOf,
+  validateStageEnvironments,
+  type StageEnvironmentMap,
+} from '@/lib/stageEnvironments';
+import type { Ec2LaunchSpec } from '@/lib/ec2LaunchSpec';
 
 interface Props {
   project: Project;
   canEdit: boolean;
   onProjectUpdated: (updates: Partial<Project>) => void;
 }
+
+const sameMap = (a: StageEnvironmentMap, b: StageEnvironmentMap) => {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) if (a[key] !== b[key]) return false;
+  return true;
+};
 
 const includedTools = (detail: EnvironmentDetail | null) => {
   const recipe = detail?.publishedRevision?.flattenedRecipe;
@@ -77,6 +95,12 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
   const [environments, setEnvironments] = useState<ManagedEnvironment[]>([]);
   const [assignment, setAssignment] = useState<ProjectEnvironmentAssignment | null>(null);
   const [selectedId, setSelectedId] = useState(project.environmentId ?? 'standard');
+  const [stageEnvironments, setStageEnvironments] = useState<StageEnvironmentMap>({});
+  const [stages, setStages] = useState<StageOption[]>([]);
+  // Published launch specs, keyed by environment id, fetched only for the EC2
+  // environments the map actually references — the requiresCompute advisory needs
+  // the machine shape, and an AgentCore environment has none to fetch.
+  const [launchSpecs, setLaunchSpecs] = useState<Record<string, Ec2LaunchSpec | null>>({});
   const [detail, setDetail] = useState<EnvironmentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -87,12 +111,29 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
   useEffect(() => {
     let active = true;
     setLoading(true);
-    Promise.all([environmentsService.list(true), projectsService.getEnvironment(project.id)])
-      .then(([available, current]) => {
+    Promise.all([
+      environmentsService.list(true),
+      projectsService.getEnvironment(project.id),
+      // The stage catalogue, for labels and for the advisory `requiresCompute`
+      // hint. Bindings are keyed by stage id rather than by a workflow placement,
+      // so the catalogue — not one workflow — is the right list to offer.
+      blocksService.list('stage').catch(() => ({ blocks: [] })),
+    ])
+      .then(([available, current, stageBlocks]) => {
         if (!active) return;
         setEnvironments(available);
         setAssignment(current);
         setSelectedId(current.environmentId || 'standard');
+        setStageEnvironments(current.stageEnvironments ?? {});
+        setStages(
+          (stageBlocks.blocks ?? [])
+            .map((block) => ({
+              stageId: block.blockId,
+              name: block.name || block.blockId,
+              requiresCompute: requiresComputeOf(block.requiresCompute),
+            }))
+            .toSorted((a, b) => a.name.localeCompare(b.name)),
+        );
       })
       .catch((err) => {
         if (active) setError(err instanceof Error ? err.message : 'Failed to load environments');
@@ -104,6 +145,41 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
       active = false;
     };
   }, [project.id]);
+
+  const boundEc2Ids = useMemo(
+    () =>
+      [...new Set(Object.values(stageEnvironments))].filter(
+        (environmentId) =>
+          environmentKindOf(environments.find((item) => item.environmentId === environmentId)) ===
+          'EC2',
+      ),
+    [environments, stageEnvironments],
+  );
+
+  useEffect(() => {
+    let active = true;
+    for (const environmentId of boundEc2Ids) {
+      if (environmentId in launchSpecs) continue;
+      void environmentsService
+        .get(environmentId)
+        .then((value) => {
+          if (active) {
+            setLaunchSpecs((current) => ({
+              ...current,
+              [environmentId]: value.publishedRevision?.launchSpec ?? null,
+            }));
+          }
+        })
+        .catch(() => {
+          // A spec we cannot read only costs the advisory, never the binding.
+          if (active) setLaunchSpecs((current) => ({ ...current, [environmentId]: null }));
+        });
+    }
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- launchSpecs read for dedupe only
+  }, [boundEc2Ids]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -127,15 +203,35 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
 
   const tools = useMemo(() => includedTools(detail), [detail]);
   const warnings = useMemo(() => compatibilityWarnings(project, detail), [project, detail]);
-  const changed = selectedId !== (assignment?.environmentId ?? project.environmentId ?? 'standard');
+  // Only AGENTCORE environments are offered as the default: several non-stage
+  // operations (init-ws, derive-artifacts, discussion assist…) resolve their
+  // runtime straight off it, and an EC2 environment has none for them to invoke.
+  // The server enforces the same rule with ENVIRONMENT_KIND_NOT_DEFAULTABLE.
+  const defaultOptions = useMemo(
+    () => environments.filter((environment) => isDefaultableEnvironment(environment)),
+    [environments],
+  );
+  const changed =
+    selectedId !== (assignment?.environmentId ?? project.environmentId ?? 'standard') ||
+    !sameMap(stageEnvironments, assignment?.stageEnvironments ?? {});
 
   const save = async () => {
+    const invalid = validateStageEnvironments(stageEnvironments);
+    if (invalid.length > 0) {
+      setError(invalid[0]);
+      return;
+    }
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
-      const next = await projectsService.assignEnvironment(project.id, selectedId);
+      const next = await projectsService.assignEnvironment(
+        project.id,
+        selectedId,
+        stageEnvironments,
+      );
       setAssignment(next);
+      setStageEnvironments(next.stageEnvironments ?? {});
       onProjectUpdated({ environmentId: next.environmentId });
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
@@ -157,7 +253,7 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
           </Badge>
         ) : null
       }
-      description="Published toolchain used by newly created intents."
+      description="Default runtime for newly created intents, plus where individual stages run."
     >
       {loading ? (
         <div className="space-y-3">
@@ -171,13 +267,17 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {environments.map((environment) => (
+              {defaultOptions.map((environment) => (
                 <SelectItem key={environment.environmentId} value={environment.environmentId}>
                   {environment.name}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
+          <p className="text-[11px] text-muted-foreground">
+            The default must be an AgentCore environment — EC2 environments are bindable to
+            individual stages only.
+          </p>
 
           {detailLoading ? (
             <Skeleton className="h-24 w-full" />
@@ -213,6 +313,17 @@ export function EnvironmentTab({ project, canEdit, onProjectUpdated }: Props) {
               </dl>
             </div>
           ) : null}
+
+          <div className="border-t pt-4">
+            <StageEnvironmentOverrides
+              stages={stages}
+              environments={environments}
+              launchSpecs={launchSpecs}
+              value={stageEnvironments}
+              onChange={setStageEnvironments}
+              disabled={!canEdit || saving}
+            />
+          </div>
 
           {warnings.length > 0 && (
             <div className="space-y-1.5 border-l-2 border-amber-500/60 pl-3">

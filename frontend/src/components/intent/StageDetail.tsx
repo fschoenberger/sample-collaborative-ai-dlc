@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { aggregateMetrics, summarizeCost } from '@/lib/metricAggregation';
 import { UsageMetrics } from '@/components/intent/UsageMetrics';
+import { StageEnvironmentBadge } from '@/components/intent/StageEnvironmentBadge';
 
 // Steering (docs/v2-steering.md): the run states a rewind may start from. A
 // RUNNING stage cannot be interrupted — the API 409s; the button hides.
@@ -240,6 +241,10 @@ export function StageDetail({ row }: { row: IntentStageRow }) {
             </>
           );
         })()}
+        <StageEnvironmentBadge
+          snapshot={detail?.intent.stageEnvironments?.[row.stageId]}
+          defaultEnvironmentId={detail?.intent.environment?.environmentId}
+        />
         {!row.planned && <span className="italic">not in the compiled plan</span>}
       </div>
 

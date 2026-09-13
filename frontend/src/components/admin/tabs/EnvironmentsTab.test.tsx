@@ -548,3 +548,204 @@ describe('EnvironmentsTab', () => {
     expect(screen.queryByText(/Reset/)).not.toBeInTheDocument();
   });
 });
+
+// EC2 environments: an operator-supplied AMI plus a machine shape. No catalogue,
+// no base, nothing built — and therefore no build/scan/verify affordances.
+const ec2Environment = {
+  environmentId: 'gpu-fleet',
+  name: 'GPU Fleet',
+  description: 'CUDA build hosts',
+  system: false,
+  status: 'READY',
+  kind: 'EC2' as const,
+  baseEnvironmentId: null,
+  currentRevisionId: 'r-ec2',
+  publishedRevisionId: null,
+  updateAvailable: false,
+  createdAt: '2026-08-10T00:00:00.000Z',
+  updatedAt: '2026-08-10T00:00:00.000Z',
+};
+
+const launchSpec = {
+  schemaVersion: 1,
+  platform: 'linux' as const,
+  architecture: 'x86_64' as const,
+  imageRef: 'ami-0123456789abcdef0',
+  imageId: 'ami-0123456789abcdef0',
+  imageOwnerAccountId: null,
+  instanceTypes: ['g5.2xlarge'],
+  instanceFamilies: [],
+  instanceRequirements: null,
+  purchaseOption: 'on-demand' as const,
+  spotFallbackToOnDemand: true,
+  allocationStrategy: 'price-capacity-optimized' as const,
+  maxPricePerHour: null,
+  availabilityZones: [],
+  rootVolume: { sizeGiB: 200, type: 'gp3' as const },
+  workspaceOnInstanceStore: false,
+  associatePublicIp: false,
+  securityGroupIds: [],
+  additionalPolicyArns: [],
+  workspacePath: '/mnt/workspace',
+  parkPolicy: 'release' as const,
+  strategyId: 'per-stage-ephemeral' as const,
+  maxInstances: 4,
+  maxConcurrentPlacements: 4,
+  maxLifetimeSeconds: 28800,
+  stageTimeoutSeconds: 28800,
+  bootstrapTimeoutSeconds: 900,
+  maxHourlyCostUsd: null,
+  tags: {},
+};
+
+const ec2Revision = {
+  environmentId: 'gpu-fleet',
+  revisionId: 'r-ec2',
+  status: 'READY',
+  kind: 'EC2' as const,
+  launchSpec,
+  launchTemplateId: 'lt-0abc',
+  launchTemplateVersion: '1',
+  runtimeCompatibilityVersion: '1',
+  createdAt: '2026-08-10T00:00:00.000Z',
+  updatedAt: '2026-08-10T00:00:00.000Z',
+};
+
+describe('EnvironmentsTab — EC2 environments', () => {
+  // Radix Select needs pointer-capture / scrollIntoView, which jsdom lacks.
+  beforeEach(() => {
+    window.HTMLElement.prototype.hasPointerCapture = vi.fn().mockReturnValue(false);
+    window.HTMLElement.prototype.setPointerCapture = vi.fn();
+    window.HTMLElement.prototype.releasePointerCapture = vi.fn();
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    list.mockResolvedValue([custom, ec2Environment, standard]);
+    listTools.mockResolvedValue([javaTool]);
+    get.mockImplementation(async (environmentId: string) =>
+      environmentId === 'standard'
+        ? standardDetail
+        : environmentId === 'gpu-fleet'
+          ? {
+              environment: ec2Environment,
+              revisions: [ec2Revision],
+              publishedRevision: null,
+            }
+          : { environment: custom, revisions: [revision], publishedRevision: null },
+    );
+    create.mockResolvedValue({ environment: ec2Environment, revision: ec2Revision });
+  });
+
+  const startEc2Draft = async (user: ReturnType<typeof userEvent.setup>) => {
+    render(<EnvironmentsTab />);
+    await screen.findByText('Generated Dockerfile');
+    await user.click(screen.getByRole('button', { name: 'New' }));
+    await user.click(await screen.findByRole('combobox', { name: 'Runs on' }));
+    await user.click(await screen.findByRole('option', { name: /EC2 instance/ }));
+    await user.type(await screen.findByLabelText('Name'), 'GPU Fleet');
+  };
+
+  it('replaces the tool-catalogue form with the launch-spec form', async () => {
+    const user = userEvent.setup();
+    await startEc2Draft(user);
+    expect(await screen.findByLabelText('AMI')).toBeInTheDocument();
+    expect(screen.queryByText('Catalog tools')).not.toBeInTheDocument();
+    expect(screen.queryByText('Base environment')).not.toBeInTheDocument();
+    // associatePublicIp is server-owned and always false, so it is never offered.
+    expect(screen.queryByLabelText(/public ip/i)).not.toBeInTheDocument();
+  });
+
+  it('refuses a malformed AMI id without calling the API', async () => {
+    const user = userEvent.setup();
+    await startEc2Draft(user);
+    await user.type(screen.getByLabelText('AMI'), 'ami-nothex');
+    await user.type(screen.getByLabelText('Instance types'), 'g5.2xlarge');
+    await user.click(screen.getByRole('button', { name: 'Create Draft' }));
+    expect(
+      await screen.findByText('imageRef must be an AMI id (ami-…) or an AMI ARN'),
+    ).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('refuses a spec with nothing to select instances on', async () => {
+    const user = userEvent.setup();
+    await startEc2Draft(user);
+    await user.type(screen.getByLabelText('AMI'), 'ami-0123456789abcdef0');
+    await user.click(screen.getByRole('button', { name: 'Create Draft' }));
+    expect(
+      await screen.findByText(
+        'declare at least one of instanceTypes, instanceFamilies or instanceRequirements',
+      ),
+    ).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('creates an EC2 environment with the launch spec and no recipe', async () => {
+    const user = userEvent.setup();
+    await startEc2Draft(user);
+    await user.type(screen.getByLabelText('AMI'), 'ami-0123456789abcdef0');
+    await user.type(screen.getByLabelText('Instance types'), 'g5.2xlarge, g5.4xlarge');
+    await user.click(screen.getByRole('button', { name: 'Create Draft' }));
+
+    expect(create).toHaveBeenCalledTimes(1);
+    const payload = create.mock.calls[0][0];
+    expect(payload.kind).toBe('EC2');
+    expect(payload.launchSpec.imageRef).toBe('ami-0123456789abcdef0');
+    expect(payload.launchSpec.instanceTypes).toEqual(['g5.2xlarge', 'g5.4xlarge']);
+    expect(payload.recipe).toBeUndefined();
+    expect(payload.baseEnvironmentId).toBeUndefined();
+    expect(payload.launchSpec.associatePublicIp).toBeUndefined();
+  });
+
+  it('surfaces the server field-level errors against the offending input', async () => {
+    const user = userEvent.setup();
+    create.mockRejectedValue(
+      Object.assign(new Error('Invalid launch spec'), {
+        status: 400,
+        body: {
+          error: 'Invalid launch spec',
+          errors: [{ field: 'imageRef', message: 'AMI ami-0123456789abcdef0 was not found' }],
+        },
+      }),
+    );
+    await startEc2Draft(user);
+    await user.type(screen.getByLabelText('AMI'), 'ami-0123456789abcdef0');
+    await user.type(screen.getByLabelText('Instance types'), 'g5.2xlarge');
+    await user.click(screen.getByRole('button', { name: 'Create Draft' }));
+    expect(await screen.findByText('AMI ami-0123456789abcdef0 was not found')).toBeInTheDocument();
+  });
+
+  it('offers no build, retry, rebuild or scan affordances for an EC2 environment', async () => {
+    const user = userEvent.setup();
+    render(<EnvironmentsTab />);
+    await user.click(await screen.findByText('gpu-fleet'));
+
+    expect(await screen.findByText('Launch spec')).toBeInTheDocument();
+    expect(screen.getByText('lt-0abc · v1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Build' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Rebuild on Latest Base' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save as New Revision' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Security scan')).not.toBeInTheDocument();
+    expect(screen.queryByText('Generated Dockerfile')).not.toBeInTheDocument();
+    expect(screen.queryByText(/This fixed-tool environment is read-only/)).not.toBeInTheDocument();
+    // DRAFT → READY → PUBLISHED: a READY EC2 revision publishes directly.
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeInTheDocument();
+  });
+
+  it('never offers an EC2 environment as a base for an AgentCore environment', async () => {
+    const user = userEvent.setup();
+    render(<EnvironmentsTab />);
+    await screen.findByText('Generated Dockerfile');
+    await user.click(screen.getByRole('button', { name: 'New' }));
+    await user.click(await screen.findByRole('combobox', { name: 'Base environment' }));
+    expect(
+      await screen.findByRole('option', { name: /Standard Node\/Python/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /GPU Fleet/ })).not.toBeInTheDocument();
+  });
+});

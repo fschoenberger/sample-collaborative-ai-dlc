@@ -1,6 +1,7 @@
 import { api } from './api';
 import type { GitProvider } from './gitProvider';
 import type { ProjectEnvironmentAssignment } from './environments';
+import type { StageEnvironmentMap } from '@/lib/stageEnvironments';
 
 export type ProjectRole = 'owner' | 'admin' | 'member';
 export type AgentCli = 'kiro' | 'claude' | 'opencode' | 'codex';
@@ -183,8 +184,14 @@ export const projectsService = {
   delete: (id: string) => api.delete(`/projects/${id}`),
   getEnvironment: (id: string) =>
     api.get<ProjectEnvironmentAssignment>(`/projects/${id}/environment`),
-  assignEnvironment: (id: string, environmentId: string) =>
-    api.put<ProjectEnvironmentAssignment>(`/projects/${id}/environment`, { environmentId }),
+  // The default environment plus the per-stage override map. The map is sent
+  // WHOLE (the endpoint replaces it), so omitting it leaves the existing bindings
+  // alone only because the caller passes the current map back unchanged.
+  assignEnvironment: (id: string, environmentId: string, stageEnvironments?: StageEnvironmentMap) =>
+    api.put<ProjectEnvironmentAssignment>(`/projects/${id}/environment`, {
+      environmentId,
+      ...(stageEnvironments ? { stageEnvironments } : {}),
+    }),
 
   // Repos
   listRepos: (projectId: string) => api.get<ProjectRepo[]>(`/projects/${projectId}/repos`),

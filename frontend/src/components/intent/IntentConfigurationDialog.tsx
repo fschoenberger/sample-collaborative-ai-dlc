@@ -13,6 +13,7 @@ import { AGENT_CLI_METADATA, AGENT_CREDENTIAL_SOURCE_LABELS } from '@/lib/agentC
 import { getIntentStageSelection } from '@/lib/intentStageSelection';
 import { getTrackerProvider } from '@/lib/trackerProviders';
 import { formatTrackerSourceLabel } from '@/lib/trackerSourceLabel';
+import { StageEnvironmentBadge } from '@/components/intent/StageEnvironmentBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -79,6 +80,11 @@ export function IntentConfigurationDialog({
 
   const intent = detail.intent;
   const environment = intent.environment;
+  // Only the stages that were bound away from the run's default are worth listing:
+  // the default is already shown once, just above.
+  const stagePlacements = Object.entries(intent.stageEnvironments ?? {})
+    .filter(([, snapshot]) => snapshot.environmentId !== environment?.environmentId)
+    .toSorted(([a], [b]) => a.localeCompare(b));
   const selection = compiled
     ? getIntentStageSelection(intent, compiled, initializationPhasePaths)
     : null;
@@ -251,6 +257,34 @@ export function IntentConfigurationDialog({
               <p className="rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground">
                 No environment snapshot was captured for this run.
               </p>
+            )}
+
+            {/* Per-stage placement, as snapshotted at create. Stages absent from
+                this list ran on the default above. */}
+            {stagePlacements.length > 0 && (
+              <div className="space-y-2">
+                <h4 className="text-xs font-medium">Stages placed elsewhere</h4>
+                <div className="divide-y rounded-md border">
+                  {stagePlacements.map(([stageId, snapshot]) => (
+                    <div
+                      key={stageId}
+                      className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+                    >
+                      <span className="font-mono text-[11px]">{stageId}</span>
+                      <span className="flex items-center gap-2">
+                        <Badge variant="secondary" className="text-[10px]">
+                          {snapshot.kind ?? 'AGENTCORE'}
+                        </Badge>
+                        <StageEnvironmentBadge
+                          snapshot={snapshot}
+                          defaultEnvironmentId={environment?.environmentId}
+                          className="gap-1 text-[10px]"
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
           </section>
         </div>
