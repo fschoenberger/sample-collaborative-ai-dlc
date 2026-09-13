@@ -827,6 +827,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // the kind to choose how the payload gets there.
         stageTarget: resolveStageTarget(meta, stage.stageId, RUNTIME_ARN()),
         enqueueStage: deps.enqueueStage,
+        // Release of the instance this stage was placed on, called when the stage
+        // ends. See releaseStageWorker in runStage.
+        releaseWorkers: deps.releaseWorkers,
         credentialBinding,
       };
       let result = await runStage(ctxArg, invokeIntentRuntime, {
@@ -1656,6 +1659,7 @@ const runStage = async (
     // below, whichever kind of machine it is.
     stageTarget,
     enqueueStage,
+    releaseWorkers,
     credentialBinding = null,
   },
 ) => {
@@ -1779,6 +1783,48 @@ const runStage = async (
     });
   }
 
+  // Release the worker when this stage is done with it — WHATEVER the outcome.
+  //
+  // This is the primary mechanism, not the reconcile sweep. The sweep is a
+  // backstop for when this call never runs (the orchestrator dies, a cancel never
+  // arrives), and it is deliberately slower and coarser. Without this call an EC2
+  // worker finishes its stage, goes IDLE, and keeps renewing its lease — so it is
+  // invisible to abandoned-lease detection, is not PROVISIONING, is present in the
+  // registry so reapOrphans skips it, and bills until maxLifetimeSeconds. Under
+  // per-stage-ephemeral that is one abandoned instance per stage.
+  //
+  // EC2 only. An AgentCore session is not ours to reap: the platform's idle
+  // timeout owns it, and park already calls stopRuntimeSession.
+  //
+  // A failed release must never fail a stage that otherwise succeeded, hence the
+  // swallow. It is also idempotent — releasing an already-gone worker answers
+  // { ok: true, released: false } — so a durable replay re-running this is safe.
+  // Released BY WORKER ID, never by executionId. Construction fans out per unit of
+  // work, so several stages of one execution can hold their own instances at once —
+  // releasing the execution would terminate a sibling mid-build. The id comes back
+  // from the placement itself.
+  let parked = false;
+  const releaseStageWorker = async () => {
+    if (stageTarget?.kind !== EC2_KIND) return;
+    const workerId = dispatch?.workerId;
+    if (!workerId) return;
+    // parkPolicy 'hold' means the instance is deliberately kept across a human
+    // gate so the agent's conversation survives; releasing it would defeat the
+    // point of that policy.
+    if (parked && stageTarget.launchSpec?.parkPolicy === 'hold') return;
+    // try/catch, not .catch(): if releaseWorkers is missing or throws
+    // synchronously, a stage that SUCCEEDED must not be reported failed because
+    // cleanup misfired. The reconcile sweep is the backstop for exactly this.
+    try {
+      await releaseWorkers({ workerId });
+    } catch (error) {
+      console.error('[orchestrator] worker release failed', {
+        workerId,
+        error: error?.message ?? String(error),
+      });
+    }
+  };
+
   try {
     // createCallback's default serdes is PASS-THROUGH (unlike steps): the
     // container's SendDurableExecutionCallbackSuccess body arrives as the raw
@@ -1786,6 +1832,7 @@ const runStage = async (
     // not an orchestrator crash.
     const raw = await stageDone;
     const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    parked = result?.state === 'WAITING_FOR_HUMAN';
     if (!result || typeof result !== 'object') {
       return reconcileFailure({
         ok: false,
@@ -1810,6 +1857,8 @@ const runStage = async (
       reason: 'stage_callback_failed',
       detail: err?.message ?? String(err),
     });
+  } finally {
+    await releaseStageWorker();
   }
 };
 

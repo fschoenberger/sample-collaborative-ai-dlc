@@ -100,6 +100,7 @@ const decodeWorker = (flat) => {
     fleetId: flat.fleetId || null,
     createdAtMs: Number(flat.createdAtMs || 0),
     lastSeenAtMs: Number(flat.lastSeenAtMs || 0),
+    idleSinceMs: Number(flat.idleSinceMs || 0),
     maxLifetimeSeconds: Number(flat.maxLifetimeSeconds || 0),
     bootstrapTimeoutSeconds: Number(flat.bootstrapTimeoutSeconds || 0),
   };
@@ -184,7 +185,13 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   };
 
   const markIdle = async (worker) => {
-    const row = await setWorkerState(worker.workerId, 'IDLE', { currentJobId: '' });
+    // idleSinceMs, because the reconciler cannot judge "idle too long" from
+    // lastSeenAtMs — a live runner keeps that fresh forever, which is exactly why a
+    // finished-but-unreleased worker was invisible to the sweep.
+    const row = await setWorkerState(worker.workerId, 'IDLE', {
+      currentJobId: '',
+      idleSinceMs: String(clock()),
+    });
     // No row means the lease is gone. Adding the id to the idle index anyway would
     // advertise a worker that does not exist.
     if (!row) return null;
@@ -194,7 +201,9 @@ export const createRegistry = ({ client, clock = nowMs }) => {
 
   const markBusy = async (worker, jobId) => {
     await client.zrem(environmentIdleKey(worker.environmentId), worker.workerId);
-    return setWorkerState(worker.workerId, 'BUSY', { currentJobId: jobId });
+    // Clear idleSinceMs: a busy worker that later goes idle must be judged from
+    // THAT moment, not from the first time it was ever idle.
+    return setWorkerState(worker.workerId, 'BUSY', { currentJobId: jobId, idleSinceMs: '' });
   };
 
   const removeWorker = async (worker) => {

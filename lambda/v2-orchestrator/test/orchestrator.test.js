@@ -158,6 +158,9 @@ beforeEach(() => {
     // Placement of an EC2 stage. Only an EC2 stage reaches it — an AgentCore stage
     // is dispatched straight through invokeRuntime above.
     enqueueStage: null, // bound to ctx below
+    // Release of the instance a finished EC2 stage was placed on. Recorded so the
+    // tests can assert it happens, and by WHICH worker id.
+    releaseWorkers: vi.fn(async () => ({ ok: true, released: true })),
     issueAgentCredentialGrant: vi.fn(async () => 'test-agent-credential-grant'),
     stopSession: vi.fn(async () => ({ stopped: true })),
     broadcast: vi.fn(async () => {}),
@@ -311,6 +314,56 @@ describe('orchestrator durable handler', () => {
       // the runtime saw only the engine's own command.
       expect(stageStarts()).toEqual([]);
       expect(invokes.map((p) => p.command)).toEqual(['init-ws']);
+    });
+
+    it('releases the instance when the stage ends, by worker id', async () => {
+      // Without this an EC2 worker finishes, goes IDLE, keeps renewing its lease and
+      // so is invisible to abandoned-lease detection, is not PROVISIONING, sits in
+      // the registry (so reapOrphans skips it) and bills until maxLifetimeSeconds.
+      // Under per-stage-ephemeral that is one abandoned instance PER STAGE.
+      deps.store.getExecution = vi.fn(async () => ec2Meta('a'));
+      oneStage();
+
+      await expect(start()).resolves.toMatchObject({ ok: true });
+
+      // BY WORKER ID, never by executionId: construction fans out per unit of work,
+      // so releasing the execution would terminate a sibling mid-build.
+      expect(deps.releaseWorkers).toHaveBeenCalledWith({ workerId: 'i-test' });
+      expect(deps.releaseWorkers).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not release for an AgentCore stage — that session is not ours to reap', async () => {
+      // The platform's idle timeout owns a session, and park already calls
+      // stopRuntimeSession. Releasing here would be meddling in someone else's
+      // lifecycle.
+      oneStage();
+
+      await expect(start()).resolves.toMatchObject({ ok: true });
+
+      expect(deps.releaseWorkers).not.toHaveBeenCalled();
+    });
+
+    it('still releases when the stage FAILS', async () => {
+      // The instance costs the same whether the stage passed or not.
+      deps.store.getExecution = vi.fn(async () => ec2Meta('a'));
+      oneStage();
+      deps.enqueueStage = makeEnqueue({ verdict: { ok: false, state: 'FAILED', reason: 'boom' } });
+
+      await start();
+
+      expect(deps.releaseWorkers).toHaveBeenCalledWith({ workerId: 'i-test' });
+    });
+
+    it('does not fail a successful stage when the release itself fails', async () => {
+      // Cleanup misfiring must not be reported as the stage misfiring; the reconcile
+      // sweep is the backstop.
+      deps.store.getExecution = vi.fn(async () => ec2Meta('a'));
+      oneStage();
+      deps.releaseWorkers = vi.fn(async () => {
+        throw new Error('scheduler unreachable');
+      });
+
+      await expect(start()).resolves.toMatchObject({ ok: true });
     });
 
     it('mixes both kinds in one run, with both verdicts on the same durable callback', async () => {

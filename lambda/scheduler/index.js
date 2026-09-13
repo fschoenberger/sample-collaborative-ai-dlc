@@ -55,6 +55,21 @@ const SUBNET_IDS = () =>
 // waiting out its own clock.
 const LEASE_IDLE_MS = () => Number(process.env.LEASE_IDLE_MS || 5 * 60 * 1000);
 
+// How long a worker may sit IDLE, holding no job, before the sweep retires it.
+//
+// This is the backstop for a release that did not happen. The orchestrator
+// releases a worker directly when its stage ends, which is immediate and free; but
+// if the orchestrator dies, or a cancel never reached it, or a callback never
+// arrived, the worker is left healthy and idle — and nothing else in this sweep can
+// see it. Its lease is renewed (the runner is alive), it is not PROVISIONING, its
+// lifetime cap is hours away, and it IS in the registry so reapOrphans skips it. It
+// would bill until maxLifetimeSeconds.
+//
+// Two minutes, because under per-stage-ephemeral nothing ever reuses a worker, so
+// an idle one is waste by definition. A pooling strategy would raise this to the
+// pool's own idle timeout.
+const WORKER_IDLE_MS = () => Number(process.env.WORKER_IDLE_MS || 2 * 60 * 1000);
+
 const jobIdFor = ({ executionId, stageInstanceId, attempt }) =>
   `job-${executionId}-${stageInstanceId}-${attempt ?? 1}`;
 
@@ -75,6 +90,7 @@ export const createScheduler = ({
   subnetIds = SUBNET_IDS(),
   describeInstances = (input) => ec2.send(new DescribeInstancesCommand(input)),
   leaseIdleMs = LEASE_IDLE_MS(),
+  workerIdleMs = WORKER_IDLE_MS(),
   issueAgentCredentialGrantFn = (claims) => issueAgentCredentialGrant(ssm, claims),
   clock = () => Date.now(),
 } = {}) => {
@@ -303,8 +319,11 @@ export const createScheduler = ({
    *                           WORKER_LEASE_SECONDS, and then it is check 4's
    *                           problem, because only EC2 knows whether an instance
    *                           came up at all.
-   *   3. lifetime caps      — a worker older than its spec allows.
-   *   4. orphan instances   — running and tagged as ours, but absent from the
+   *   3. idle workers       — finished its stage and nobody released it. The
+   *                           direct release on stage exit is the mechanism; this
+   *                           is the backstop for when that never ran.
+   *   4. lifetime caps      — a worker older than its spec allows.
+   *   5. orphan instances   — running and tagged as ours, but absent from the
    *                           registry. This is the check that makes Valkey
    *                           disposable: EC2 is the authority on what exists.
    *
@@ -321,6 +340,7 @@ export const createScheduler = ({
     const abandoned = [];
     const timedOut = [];
     const expired = [];
+    const idle = [];
 
     for (const environmentId of environmentIds) {
       for (const entry of await registry.claimAbandoned({ environmentId, idleMs: leaseIdleMs })) {
@@ -347,6 +367,17 @@ export const createScheduler = ({
           timedOut.push(worker.workerId);
           continue;
         }
+        // Finished its work and nobody released it. `lastSeenAtMs` is the wrong
+        // clock here — a live runner keeps that fresh forever — so this is judged on
+        // when the worker last went IDLE, which markIdle stamps.
+        if (worker.state === 'IDLE' && !worker.currentJobId) {
+          const idleForMs = now - (worker.idleSinceMs || worker.lastSeenAtMs || worker.createdAtMs);
+          if (idleForMs > workerIdleMs) {
+            await releaseWorker({ workerId: worker.workerId });
+            idle.push(worker.workerId);
+            continue;
+          }
+        }
         if (worker.maxLifetimeSeconds > 0 && ageSeconds > worker.maxLifetimeSeconds) {
           await releaseWorker({ workerId: worker.workerId });
           expired.push(worker.workerId);
@@ -355,7 +386,7 @@ export const createScheduler = ({
     }
 
     const orphans = await reapOrphans({ environmentIds });
-    return { ok: true, abandoned, timedOut, expired, orphans };
+    return { ok: true, abandoned, timedOut, expired, idle, orphans };
   };
 
   // EC2 is the authority on which instances exist. Anything running with our tag
