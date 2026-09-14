@@ -401,6 +401,7 @@ export const ensureWorkspaceSource = async ({
   const multi = repos.length > 1;
   const restoredRepos = [];
   const failed = [];
+  const reasons = [];
   for (const repo of repos) {
     const url = typeof repo === 'string' ? repo : repo.url;
     const provider =
@@ -410,7 +411,10 @@ export const ensureWorkspaceSource = async ({
       'github';
     const targetDir = repoTargetDir({ url, workspaceDir, multi });
     if (await hasCheckout(targetDir, statFn)) {
-      if (!(await trustDirectory({ targetDir, runner }))) failed.push(url);
+      if (!(await trustDirectory({ targetDir, runner }))) {
+        failed.push(url);
+        reasons.push(`${url}: safe_directory_config_failed`);
+      }
       continue;
     }
     // Missing: re-clone this one. A failure leaves no reusable `.git` state.
@@ -428,7 +432,19 @@ export const ensureWorkspaceSource = async ({
       trustDirectory,
     });
     restoredRepos.push(url);
-    if (!res.cloned || res.branchOk === false) failed.push(url);
+    if (!res.cloned || res.branchOk === false) {
+      failed.push(url);
+      // WHY it failed, not just that it did. Without this the caller can only
+      // report "could not re-clone: <url>", which is what a resume-after-park
+      // failure looked like in production: no credential error, no git stderr, no
+      // way to tell an auth problem from a missing branch from a network problem.
+      // checkoutRepo already distinguishes them (credential_unavailable,
+      // clone_failed, a non-zero git code); this stops that being discarded.
+      reasons.push(
+        `${url}: ${res.error || (res.branchOk === false ? 'branch_checkout_failed' : 'clone_failed')}` +
+          (res.code == null ? '' : ` (exit ${res.code})`),
+      );
+    }
   }
-  return { restored: restoredRepos.length > 0, repos: restoredRepos, failed };
+  return { restored: restoredRepos.length > 0, repos: restoredRepos, failed, reasons };
 };

@@ -76,6 +76,9 @@ const encodeWorker = (worker) => {
     stageInstanceId: worker.stageInstanceId ?? '',
     currentJobId: worker.currentJobId ?? '',
     draining: worker.draining ? '1' : '',
+    // Held across a human gate under parkPolicy `hold`: idle deliberately, so the
+    // reconciler's idle reap must leave it alone.
+    parked: worker.parked ? '1' : '',
     createdAtMs: String(worker.createdAtMs ?? nowMs()),
     lastSeenAtMs: String(worker.lastSeenAtMs ?? nowMs()),
     maxLifetimeSeconds: String(worker.maxLifetimeSeconds ?? 0),
@@ -99,6 +102,7 @@ const decodeWorker = (flat) => {
     stageInstanceId: flat.stageInstanceId || null,
     currentJobId: flat.currentJobId || null,
     draining: flat.draining === '1',
+    parked: flat.parked === '1',
     instanceId: flat.instanceId || null,
     sessionId: flat.sessionId || null,
     fleetId: flat.fleetId || null,
@@ -207,7 +211,13 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     await client.zrem(environmentIdleKey(worker.environmentId), worker.workerId);
     // Clear idleSinceMs: a busy worker that later goes idle must be judged from
     // THAT moment, not from the first time it was ever idle.
-    return setWorkerState(worker.workerId, 'BUSY', { currentJobId: jobId, idleSinceMs: '' });
+    // Clears `parked` too: taking work means the gate was answered and this worker
+    // is no longer holding a suspended stage.
+    return setWorkerState(worker.workerId, 'BUSY', {
+      currentJobId: jobId,
+      idleSinceMs: '',
+      parked: '',
+    });
   };
 
   const removeWorker = async (worker) => {

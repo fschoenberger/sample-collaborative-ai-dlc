@@ -2685,6 +2685,24 @@ describe('runStage — source self-heal (wiped /mnt/workspace)', () => {
     expect(spawned).toBe(false);
   });
 
+  it('names WHY a re-clone failed, not just which repo', async () => {
+    // A resume-after-park failed in production with `could not re-clone:
+    // fschoenberger/open-creative-suite` and nothing else — no credential error, no
+    // git stderr, no way to tell auth from a missing branch from a network problem.
+    // ensureWorkspaceSource knows the cause; the detail must carry it.
+    const deps = baseDeps({
+      ensureWorkspaceSource: async () => ({
+        restored: true,
+        repos: [],
+        failed: ['acme/api'],
+        reasons: ['acme/api: credential_unavailable'],
+      }),
+    });
+    const res = await runStage({ ...baseArgs, repos: ['acme/api'] }, deps);
+    expect(res).toMatchObject({ ok: false, reason: 'workspace_restore_failed' });
+    expect(res.detail).toContain('credential_unavailable');
+  });
+
   it('does not emit a restored event for a repo-less project (no-op heal)', async () => {
     const deps = baseDeps({
       spawnFn: okSpawn,

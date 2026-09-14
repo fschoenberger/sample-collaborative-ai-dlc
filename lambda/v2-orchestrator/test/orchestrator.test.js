@@ -161,6 +161,7 @@ beforeEach(() => {
     // Release of the instance a finished EC2 stage was placed on. Recorded so the
     // tests can assert it happens, and by WHICH worker id.
     releaseWorkers: vi.fn(async () => ({ ok: true, released: true })),
+    parkWorker: vi.fn(async () => ({ ok: true, parked: true })),
     issueAgentCredentialGrant: vi.fn(async () => 'test-agent-credential-grant'),
     stopSession: vi.fn(async () => ({ stopped: true })),
     broadcast: vi.fn(async () => {}),
@@ -279,10 +280,21 @@ describe('orchestrator durable handler', () => {
         valid: true,
         plan: { stages: [{ stageId: 'a', ...(stageInstanceId ? { stageInstanceId } : {}) }] },
       });
-    const ec2Meta = (...stageIds) => ({
-      ...META,
-      stageEnvironments: Object.fromEntries(stageIds.map((id) => [id, EC2_STAGE_ENVIRONMENT])),
-    });
+    // Trailing object = launchSpec overrides for the bound environment, so a test can
+    // set parkPolicy without every existing varargs caller changing.
+    const ec2Meta = (...stageIds) => {
+      const overrides = typeof stageIds.at(-1) === 'object' ? stageIds.pop() : null;
+      const env = overrides
+        ? {
+            ...EC2_STAGE_ENVIRONMENT,
+            launchSpec: { ...EC2_STAGE_ENVIRONMENT.launchSpec, ...overrides },
+          }
+        : EC2_STAGE_ENVIRONMENT;
+      return {
+        ...META,
+        stageEnvironments: Object.fromEntries(stageIds.map((id) => [id, env])),
+      };
+    };
 
     it('invokes the runtime for an AgentCore stage and never asks the scheduler', async () => {
       oneStage();
@@ -330,6 +342,45 @@ describe('orchestrator durable handler', () => {
       // so releasing the execution would terminate a sibling mid-build.
       expect(deps.releaseWorkers).toHaveBeenCalledWith({ workerId: 'i-test' });
       expect(deps.releaseWorkers).toHaveBeenCalledTimes(1);
+    });
+
+    it('HOLDS the instance across a park and resumes onto the SAME one', async () => {
+      // parkPolicy hold exists because the agent's conversation and its checkout live
+      // on that instance. Releasing there sends the resume to a fresh machine with an
+      // empty workspace, which re-clones and loses the thread — seen in production as
+      // `workspace_restore_failed: could not re-clone` immediately after a gate was
+      // answered.
+      deps.store.getExecution = vi
+        .fn()
+        .mockResolvedValueOnce(ec2Meta('a', { parkPolicy: 'hold' }))
+        .mockResolvedValue({
+          ...ec2Meta('a', { parkPolicy: 'hold' }),
+          pendingHumanTaskId: 'h1',
+        });
+      oneStage();
+      let n = 0;
+      deps.enqueueStage = vi.fn(async ({ payload, resumeWorkerId }) => {
+        n += 1;
+        enqueued.push({ payload, resumeWorkerId });
+        const resolve = ctx.stageCallbackResolvers.get(payload.stageCallbackId);
+        resolve(
+          n === 1
+            ? { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' }
+            : { ok: true, state: 'SUCCEEDED' },
+        );
+        return { ok: true, action: 'provision', jobId: `job-${n}`, workerId: 'i-held' };
+      });
+
+      await start();
+
+      // Marked held so the reconciler's idle reap leaves it alone...
+      expect(deps.parkWorker).toHaveBeenCalledWith({ workerId: 'i-held', parked: true });
+      // ...and released EXACTLY ONCE — when the resumed stage actually finished, not
+      // when it parked. Two calls would mean the park released it too, which is the
+      // bug this test exists for.
+      expect(deps.releaseWorkers).toHaveBeenCalledTimes(1);
+      // And the resume asked for that exact instance back.
+      expect(enqueued[1].resumeWorkerId).toBe('i-held');
     });
 
     it('does not release for an AgentCore stage — that session is not ours to reap', async () => {

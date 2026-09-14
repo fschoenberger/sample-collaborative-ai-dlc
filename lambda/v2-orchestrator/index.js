@@ -213,6 +213,9 @@ const defaultDeps = () => ({
   enqueueStage: (input) => defaultSchedulerOperation({ action: 'enqueue-stage', ...input }),
   dispatchToWorker: (input) => defaultSchedulerOperation({ action: 'dispatch', ...input }),
   releaseWorkers: (input) => defaultSchedulerOperation({ action: 'release', ...input }),
+  // Tell the scheduler a worker is holding a parked stage, so its idle reap leaves
+  // it alone. See parkWorker in lambda/scheduler.
+  parkWorker: (input) => defaultSchedulerOperation({ action: 'park', ...input }),
   loadPlan: (args) => loadExecutionPlan({ ddb, tableName: BLOCKS_TABLE(), ...args }),
   invokeRuntime: defaultInvokeRuntime,
   issueAgentCredentialGrant: (claims) => issueAgentCredentialGrant(ssm, claims),
@@ -830,6 +833,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // Release of the instance this stage was placed on, called when the stage
         // ends. See releaseStageWorker in runStage.
         releaseWorkers: deps.releaseWorkers,
+        parkWorker: deps.parkWorker,
         credentialBinding,
       };
       let result = await runStage(ctxArg, invokeIntentRuntime, {
@@ -1005,6 +1009,12 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         result = await runStage(ctxArg, invokeIntentRuntime, {
           ...stageOpts,
           resumeFrom: humanTaskId,
+          // Resume onto the instance the parked stage is still holding, when there
+          // is one. Under parkPolicy `hold` the worker was deliberately NOT released,
+          // and the agent's conversation plus its checkout only exist there — a fresh
+          // instance would mean an empty workspace, a re-clone, and an agent that has
+          // forgotten the question it asked.
+          resumeWorkerId: result.heldWorkerId ?? null,
         });
       }
 
@@ -1660,6 +1670,12 @@ const runStage = async (
     stageTarget,
     enqueueStage,
     releaseWorkers,
+    parkWorker,
+    // The instance a parked stage is still holding, when parkPolicy is `hold`.
+    // Threaded back in by the park loop so the resume lands on the SAME machine —
+    // which is the entire point of that policy: the agent's conversation and its
+    // checkout are in that instance's memory and disk.
+    resumeWorkerId: heldWorkerId = null,
     credentialBinding = null,
   },
 ) => {
@@ -1763,10 +1779,13 @@ const runStage = async (
           // lives 300s and the gap to a worker claiming a queued job is an instance
           // cold boot, so the scheduler mints from this binding at claim time.
           credentialBinding,
-          // Only a worker held across a park (parkPolicy: hold) needs addressing,
-          // and the scheduler resolves that from the registry rather than the
-          // orchestrator tracking worker ids.
-          resumeWorkerId: null,
+          // The instance a parked stage is still holding, under parkPolicy `hold`.
+          // Naming it here is what makes the resume land back on the machine that
+          // holds the agent's conversation and its checkout; the strategy turns a set
+          // resumeWorkerId into an addressed dispatch rather than a fresh launch.
+          // null for AgentCore (its session is released on park and re-materialized)
+          // and for `release`, where the instance is already gone.
+          resumeWorkerId: heldWorkerId,
           payload: stagePayload(),
         })
       : invokeRuntime(stagePayload(), sessionId),
@@ -1811,7 +1830,19 @@ const runStage = async (
     // parkPolicy 'hold' means the instance is deliberately kept across a human
     // gate so the agent's conversation survives; releasing it would defeat the
     // point of that policy.
-    if (parked && stageTarget.launchSpec?.parkPolicy === 'hold') return;
+    if (parked && stageTarget.launchSpec?.parkPolicy === 'hold') {
+      // Keep it, and SAY so. Without the mark the reconciler sees an idle worker
+      // holding no job and reaps it, which quietly turns a hold into a release.
+      try {
+        await parkWorker?.({ workerId, parked: true });
+      } catch (error) {
+        console.error('[orchestrator] could not mark worker parked', {
+          workerId,
+          error: error?.message ?? String(error),
+        });
+      }
+      return;
+    }
     // try/catch, not .catch(): if releaseWorkers is missing or throws
     // synchronously, a stage that SUCCEEDED must not be reported failed because
     // cleanup misfired. The reconcile sweep is the backstop for exactly this.
@@ -1833,6 +1864,12 @@ const runStage = async (
     const raw = await stageDone;
     const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
     parked = result?.state === 'WAITING_FOR_HUMAN';
+    // Hand the held instance back to the park loop. Only under `hold`, and only for
+    // EC2 — otherwise the worker is gone by the time the gate is answered and naming
+    // it would send the resume at a machine that no longer exists.
+    if (parked && stageTarget?.kind === EC2_KIND && stageTarget.launchSpec?.parkPolicy === 'hold') {
+      result.heldWorkerId = dispatch?.workerId ?? null;
+    }
     if (!result || typeof result !== 'object') {
       return reconcileFailure({
         ok: false,

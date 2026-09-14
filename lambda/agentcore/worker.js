@@ -119,6 +119,7 @@ export const createWorker = ({
   const registry = createRegistry({ client, clock });
   let running = false;
   let shuttingDown = false;
+  let claiming = true;
   let jobsClaimed = 0;
   let heartbeatTimer = null;
 
@@ -185,7 +186,7 @@ export const createWorker = ({
   // Unassigned work. XREADGROUP with a block is the claim: the entry moves into
   // the group's pending list under this worker's name, which IS the lease.
   const claimLoop = async () => {
-    while (running && !shuttingDown) {
+    while (running && !shuttingDown && claiming) {
       let delivered;
       try {
         delivered = await client.xreadgroup(
@@ -231,7 +232,18 @@ export const createWorker = ({
               jobsClaimed,
               maxJobs,
             });
-            shuttingDown = true;
+            // Stop CLAIMING, but stay alive. Two different things:
+            //
+            //   - the shared queue is where a dying worker can steal a successor's
+            //     job, so it must stop reading that;
+            //   - the ADDRESSED stream is work aimed at this worker specifically —
+            //     a resume after a park under `parkPolicy: hold`, where the whole
+            //     point is that THIS instance still holds the agent's conversation
+            //     and its checkout. Killing the process here would defeat that.
+            //
+            // Terminating the instance is the scheduler's job, not ours: it releases
+            // on stage exit under `release`, and the reconciler's caps catch strays.
+            claiming = false;
           }
         }
       }

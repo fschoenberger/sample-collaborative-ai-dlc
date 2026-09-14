@@ -98,12 +98,25 @@ export const EC2_LAUNCH_SPEC_DEFAULTS = {
   workspaceOnInstanceStore: false,
   associatePublicIp: false,
   workspacePath: '/mnt/workspace',
-  parkPolicy: 'release',
+  // HOLD by default. A parked stage is SUSPENDED, not finished: the agent asked a
+  // question and is waiting for an answer, and its conversation plus its checkout
+  // exist only on that instance. Releasing there means the resume lands on a fresh
+  // machine with an empty workspace, re-clones, and loses the thread — which is
+  // exactly what it did before this default changed. `release` remains available for
+  // an environment that would rather pay a re-clone than hold an instance across a
+  // human gate, but it must be chosen deliberately.
+  parkPolicy: 'hold',
   strategyId: 'per-stage-ephemeral',
   maxInstances: 4,
   maxConcurrentPlacements: 4,
-  maxLifetimeSeconds: 28800,
-  stageTimeoutSeconds: 28800,
+  // Four hours, not the 28800 maximum. With `hold` as the default park policy an
+  // instance can be kept across a human gate, so the default lifetime IS the bound on
+  // what an unanswered gate can cost — leaving it at the maximum would make the
+  // common case an 8-hour bill nobody chose. An operator who wants longer sets it.
+  maxLifetimeSeconds: 14400,
+  // Matches the default lifetime: a stage cannot usefully outlive the instance it
+  // runs on, and stageTimeoutSeconds > maxLifetimeSeconds is refused below.
+  stageTimeoutSeconds: 14400,
   bootstrapTimeoutSeconds: 900,
 };
 

@@ -230,7 +230,9 @@ export const mergeLane = async (
     return {
       ok: false,
       reason: 'workspace_restore_failed',
-      detail: heal?.error ?? `could not re-clone: ${heal.failed.join(', ')}`,
+      detail:
+        heal?.error ??
+        `could not re-clone: ${(heal.reasons?.length ? heal.reasons : heal.failed).join('; ')}`,
     };
   }
 
@@ -352,7 +354,9 @@ export const reconcileLane = async (
     return {
       ok: false,
       reason: 'workspace_restore_failed',
-      detail: heal?.error ?? `could not re-clone: ${heal.failed.join(', ')}`,
+      detail:
+        heal?.error ??
+        `could not re-clone: ${(heal.reasons?.length ? heal.reasons : heal.failed).join('; ')}`,
     };
   }
 

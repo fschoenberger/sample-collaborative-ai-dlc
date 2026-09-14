@@ -272,6 +272,21 @@ export const createScheduler = ({
     return { ok: true, agentCredentialGrant };
   };
 
+  /**
+   * Mark a worker as holding a parked stage, or release that mark.
+   *
+   * The scheduler cannot know a stage parked — the orchestrator owns that fact — and
+   * the reconciler needs it, because a held worker is idle ON PURPOSE and its idle
+   * reap would otherwise silently turn a `hold` into a `release` and break the
+   * resume. The lifetime cap still applies, so an abandoned gate cannot bill forever.
+   */
+  const parkWorker = async ({ workerId, parked = true }) => {
+    const worker = await registry.getWorker(workerId);
+    if (!worker) return { ok: false, reason: 'worker_not_found' };
+    await registry.setWorkerState(workerId, worker.state, { parked: parked ? '1' : '' });
+    return { ok: true, workerId, parked };
+  };
+
   const dispatch = async ({ workerId, type, jobId = '', reason = '' }) => {
     const worker = await registry.getWorker(workerId);
     if (!worker) return { ok: false, reason: 'worker_not_found' };
@@ -386,7 +401,12 @@ export const createScheduler = ({
         // Finished its work and nobody released it. `lastSeenAtMs` is the wrong
         // clock here — a live runner keeps that fresh forever — so this is judged on
         // when the worker last went IDLE, which markIdle stamps.
-        if (worker.state === 'IDLE' && !worker.currentJobId) {
+        // A worker holding a parked stage is idle ON PURPOSE — it is waiting for a
+        // human, keeping the agent's conversation and checkout alive under
+        // parkPolicy `hold`. Reaping it would silently convert a hold into a release
+        // and break the resume. Its lifetime cap still applies, so an abandoned gate
+        // cannot bill forever.
+        if (worker.state === 'IDLE' && !worker.currentJobId && !worker.parked) {
           const idleForMs = now - (worker.idleSinceMs || worker.lastSeenAtMs || worker.createdAtMs);
           if (idleForMs > workerIdleMs) {
             await releaseWorker({ workerId: worker.workerId });
@@ -442,6 +462,7 @@ export const createScheduler = ({
   return {
     enqueueStage,
     dispatch,
+    parkWorker,
     releaseWorker,
     releaseExecution,
     describeFleet,
@@ -467,6 +488,8 @@ export const handler = async (event, _context, scheduler = defaultScheduler()) =
         return await scheduler.enqueueStage(event);
       case 'dispatch':
         return await scheduler.dispatch(event);
+      case 'park':
+        return await scheduler.parkWorker(event);
       case 'release':
         return event.executionId
           ? await scheduler.releaseExecution(event)

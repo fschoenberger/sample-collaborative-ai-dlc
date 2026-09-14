@@ -1305,7 +1305,12 @@ export const runStage = async (
       return fail(
         stageInstanceId,
         'workspace_restore_failed',
-        `could not re-clone: ${heal.failed.join(', ')}`,
+        // Name the CAUSE. `heal.reasons` carries one entry per failed repo with the
+        // code checkoutRepo produced; falling back to the bare url list only when a
+        // caller predates that.
+        heal.reasons?.length
+          ? `could not re-clone: ${heal.reasons.join('; ')}`
+          : `could not re-clone: ${heal.failed.join(', ')}`,
       );
     sourceRestored = Boolean(heal?.restored);
     if (sourceRestored) {

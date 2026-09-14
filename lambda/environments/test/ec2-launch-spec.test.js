@@ -60,8 +60,13 @@ describe('validateEc2LaunchSpec', () => {
       imageId: 'ami-0414318400ea0708a',
       purchaseOption: 'on-demand',
       allocationStrategy: 'price-capacity-optimized',
-      // release is the default because hold bills for the whole human wait.
-      parkPolicy: 'release',
+      // HOLD is the default: a parked stage is suspended, not finished, and the
+      // agent's conversation and checkout live on that instance. The default
+      // lifetime is what bounds the cost of an unanswered gate, which is why it is
+      // below the maximum.
+      parkPolicy: 'hold',
+      maxLifetimeSeconds: 14400,
+      stageTimeoutSeconds: 14400,
       strategyId: 'per-stage-ephemeral',
       associatePublicIp: false,
       workspacePath: '/mnt/workspace',
@@ -178,8 +183,16 @@ describe('validateEc2LaunchSpec', () => {
     expect(fieldsOf(errors)).toContain('maxConcurrentPlacements');
   });
 
-  it('refuses parkPolicy hold without a lifetime cap below the maximum', () => {
-    const { valid, errors } = validateEc2LaunchSpec({ ...baseSpec(), parkPolicy: 'hold' });
+  it('refuses parkPolicy hold at the MAXIMUM lifetime', () => {
+    // hold is the default, but holding for the full 8h maximum has to be deliberate:
+    // an unanswered gate would bill the whole window. Asking for both explicitly is
+    // what makes it a decision rather than an accident.
+    const { valid, errors } = validateEc2LaunchSpec({
+      ...baseSpec(),
+      parkPolicy: 'hold',
+      maxLifetimeSeconds: 28800,
+      stageTimeoutSeconds: 28800,
+    });
     expect(valid).toBe(false);
     expect(errors.find((e) => e.field === 'parkPolicy')?.message).toMatch(/human wait/);
   });
