@@ -234,9 +234,14 @@ const _refreshInFlight = new Map();
 const ensureFreshGitToken = async ({ ssm, secrets, ddb, item, gitProvider, staleToken = null }) => {
   if (!item?.parameterName) throw new Error('No SSM parameter name set');
   const tokens = await readTokenValue(ssm, item.parameterName);
-  // Only GitLab and Bitbucket issue expiring OAuth tokens with refresh tokens.
-  // GitHub OAuth-App tokens never expire (passthrough); a provider without a
-  // stored refresh token can't be refreshed either.
+  // GitLab and Bitbucket issue expiring OAuth tokens with refresh tokens, and are
+  // refreshed here. GitHub is passthrough — but NOT because its tokens cannot
+  // expire: an OAuth App can be set to expire user tokens after 8 hours, and this
+  // deployment had that on. The stage failure it produced named neither auth nor
+  // expiry (`could not re-clone`), and it recurred 8 hours after every connect.
+  // Passthrough is only correct while that setting is OFF; turning it on means
+  // adding github here and capturing refresh_token in git-providers/github.js.
+  // A provider without a stored refresh token can't be refreshed either.
   const refreshable = gitProvider === 'gitlab' || gitProvider === 'bitbucket';
   if (!refreshable || !tokens.refreshToken) {
     return tokens.accessToken;
