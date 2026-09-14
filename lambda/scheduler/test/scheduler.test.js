@@ -477,6 +477,8 @@ describe.skipIf(!host)('scheduler', () => {
       const scheduler = schedulerWith(provisioners, {
         describeInstances: noInstances,
         clock: () => now,
+        // Finished, so the reap is allowed to collect it.
+        readExecution: async () => ({ status: 'SUCCEEDED', process: { stages: [] } }),
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
       await registry.markIdle(await registry.getWorker(workerId));
@@ -524,6 +526,79 @@ describe.skipIf(!host)('scheduler', () => {
 
       expect(result.environmentIds).toContain(environmentId);
       expect(result.orphans).toEqual(['i-rowless']);
+    });
+
+    it('does NOT reap an idle-looking worker whose stage is still running', async () => {
+      // The row lies. `run-stage-start` accepts a stage and returns in milliseconds
+      // while the stage runs on detached, so a worker built before the busy-drain fix
+      // reads IDLE for the whole duration of a build. Reaping it terminates the
+      // instance mid-stage — SIGTERM to the CLI, `cli_nonzero_exit: 143`, three
+      // artifacts already written and thrown away. The execution is the authority.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        readExecution: async () => ({
+          status: 'RUNNING',
+          process: { stages: [{ stageId: 'reverse-engineering', state: 'RUNNING' }] },
+        }),
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.idle).not.toContain(workerId);
+      expect(provisioners.ec2Stub.terminate).not.toHaveBeenCalled();
+    });
+
+    it('reaps an idle worker once its execution has finished', async () => {
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        readExecution: async () => ({
+          status: 'SUCCEEDED',
+          process: { stages: [{ stageId: 'reverse-engineering', state: 'SUCCEEDED' }] },
+        }),
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.idle).toContain(workerId);
+    });
+
+    it('spares a reap candidate whose execution cannot be read', async () => {
+      // Fail closed: a worker left alive is bounded by its lifetime cap, a worker
+      // killed mid-stage destroys hours of work and a human's answered gates.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        readExecution: async () => {
+          throw new Error('ThrottlingException');
+        },
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.idle).not.toContain(workerId);
     });
 
     it('drops a queued entry whose execution no longer exists', async () => {

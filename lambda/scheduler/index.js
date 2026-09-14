@@ -390,6 +390,38 @@ export const createScheduler = ({
    * terminate the instance, so the instance that outlives its runner is found by
    * asking EC2, not by reading Valkey.
    */
+  /**
+   * Is this worker's execution still running the stage it was placed for?
+   *
+   * Fails CLOSED — an execution it cannot read, or one with no stage rows yet, counts
+   * as RUNNING and the worker is spared. A worker left alive costs money and is
+   * bounded by its lifetime cap; a worker killed mid-stage destroys hours of work and
+   * a human's answered gates.
+   */
+  const executionHasRunningStage = async (worker) => {
+    if (!worker?.executionId) return false;
+    let execution;
+    try {
+      execution = await readExecution(worker.executionId);
+    } catch (error) {
+      console.error('[scheduler] could not read execution for a reap candidate', {
+        workerId: worker.workerId,
+        executionId: worker.executionId,
+        error: error?.message,
+      });
+      return true;
+    }
+    if (!execution) return false;
+    if (!LIVE_EXECUTION_STATUSES.has(execution.status)) return false;
+    const stages = execution.process?.stages ?? [];
+    if (!Array.isArray(stages) || stages.length === 0) return true;
+    return stages.some(
+      (stage) =>
+        stage?.state === 'RUNNING' &&
+        (!worker.stageInstanceId || stage.stageInstanceId === worker.stageInstanceId),
+    );
+  };
+
   // Every instance this scheduler owns that is currently alive. One call, shared by
   // the sweep and the orphan reap so they cannot disagree about what exists.
   const runningManagedInstances = async () => {
@@ -473,7 +505,20 @@ export const createScheduler = ({
         // cannot bill forever.
         if (worker.state === 'IDLE' && !worker.currentJobId && !worker.parked) {
           const idleForMs = now - (worker.idleSinceMs || worker.lastSeenAtMs || worker.createdAtMs);
-          if (idleForMs > workerIdleMs) {
+          // An IDLE row is NOT proof the machine is free.
+          //
+          // `run-stage-start` accepts a stage and returns in milliseconds while the
+          // stage runs on detached, so a worker's row reads IDLE for the whole
+          // duration of a build unless the runner waits for that detached job. A
+          // runner that does not (any image built before the busy-drain fix) would be
+          // terminated mid-stage by the reap below: SIGTERM to the CLI, surfacing as
+          // `cli_nonzero_exit: 143` with three artifacts already written.
+          //
+          // So ask the execution, which cannot be fooled by the row: a stage of it
+          // still RUNNING means this machine is doing that work. Checked only for a
+          // worker that is otherwise about to be reaped, so it costs one GetItem per
+          // reap candidate rather than one per sweep.
+          if (idleForMs > workerIdleMs && !(await executionHasRunningStage(worker))) {
             await releaseWorker({ workerId: worker.workerId });
             idle.push(worker.workerId);
             continue;
@@ -632,6 +677,7 @@ export const createScheduler = ({
     reconcile,
     reapOrphans,
     sweepQueue,
+    executionHasRunningStage,
     environmentsToSweep,
   };
 };
