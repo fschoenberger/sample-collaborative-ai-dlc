@@ -668,16 +668,16 @@ describe.skipIf(!host)('scheduler', () => {
       const environmentId = nextEnv();
       const provisioners = stubProvisioners();
       let now = 5_000_000;
-      let firstCall = true;
       const scheduler = schedulerWith(provisioners, {
         clock: () => now,
-        // The sweep's own listing succeeds; the per-candidate tag lookup fails.
-        describeInstances: async () => {
-          if (firstCall) {
-            firstCall = false;
-            return { Reservations: [] };
-          }
-          throw new Error('RequestLimitExceeded');
+        // The sweep's own listing (by Filters) succeeds; only the per-candidate tag
+        // lookup (by InstanceIds) fails. Distinguished on the input rather than a call
+        // counter, because the listing runs twice per sweep — once to discover
+        // environments, once to reap orphans — and a counter made reapOrphans throw and
+        // took the whole reconcile pass down with it.
+        describeInstances: async (input) => {
+          if (input?.InstanceIds) throw new Error('RequestLimitExceeded');
+          return { Reservations: [] };
         },
         readExecution: async () => ({ status: 'SUCCEEDED', process: { stages: [] } }),
       });
