@@ -38,6 +38,15 @@ variable "environment_registry_table_arn" {
   type        = string
 }
 
+variable "v2_executions_table_name" {
+  # The reconciler's queue sweep reads execution META to decide whether a queued job
+  # can still run. Only the ARN was passed before, so the sweep had no table to read
+  # and failed closed on every entry — which is the safe direction, but meant it never
+  # dropped anything and a dead queue entry could still starve a worker.
+  description = "Name of the v2 executions table, read by the reconciler's queue sweep"
+  type        = string
+}
+
 variable "v2_executions_table_arn" {
   description = "v2 executions table ARN — the scheduler reads job/execution state"
   type        = string

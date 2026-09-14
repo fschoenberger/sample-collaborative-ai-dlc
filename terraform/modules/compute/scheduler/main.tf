@@ -272,6 +272,10 @@ module "scheduler_lambda" {
     LEASE_IDLE_MS                       = tostring(var.lease_idle_ms)
     EXECUTOR_SUBNET_IDS                 = join(",", aws_subnet.cache[*].id)
     EXECUTOR_INSTANCE_PROFILE_ARN       = var.executor_instance_profile_arn
+    # Read by the reconciler's queue sweep to tell a deleted execution from an
+    # unreadable one: the first means the queued entry is a corpse and must go, the
+    # second means keep it. Without this the sweep could only ever do the latter.
+    V2_PROCESS_TABLE                    = var.v2_executions_table_name
   }
 }
 

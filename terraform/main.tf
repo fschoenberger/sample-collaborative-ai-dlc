@@ -670,6 +670,7 @@ module "scheduler" {
   environment_registry_table_name = module.dynamodb.environment_registry_table_name
   environment_registry_table_arn  = module.dynamodb.environment_registry_table_arn
   v2_executions_table_arn         = module.agentcore.v2_executions_table_arn
+  v2_executions_table_name        = module.agentcore.v2_executions_table_name
 
   agent_credential_grant_secret_param_name = aws_ssm_parameter.agent_credential_grant_secret.name
   agentcore_runtime_arn                    = module.agentcore.runtime_arn
