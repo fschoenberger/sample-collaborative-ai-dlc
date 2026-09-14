@@ -400,6 +400,7 @@ module "control_lambda" {
     ENVIRONMENT                   = var.environment
     EXECUTOR_INSTANCE_PROFILE_ARN = var.executor_instance_profile_arn
     EXECUTOR_SECURITY_GROUP_ID    = var.executor_security_group_id
+    WORKER_LOG_GROUP              = var.worker_log_group_name
     VALKEY_HOST                   = var.valkey_host
     VALKEY_PORT                   = var.valkey_port
     SCHEDULER_FUNCTION            = var.scheduler_function_name

@@ -613,6 +613,7 @@ module "managed_environments" {
   # EC2 environments: the ingredients a per-revision launch template must carry.
   executor_instance_profile_arn = module.ec2_executors.instance_profile_arn
   executor_security_group_id    = module.scheduler.client_security_group_id
+  worker_log_group_name         = module.ec2_executors.log_group_name
   valkey_host                   = module.scheduler.valkey_host
   valkey_port                   = tostring(module.scheduler.valkey_port)
   scheduler_function_name       = module.scheduler.function_name

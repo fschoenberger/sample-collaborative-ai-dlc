@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   LAUNCH_TEMPLATE_CONTRACT_VERSION,
+  cloudWatchAgentConfig,
   createLaunchTemplateForRevision,
   launchTemplateInput,
   renderUserData,
@@ -34,6 +35,7 @@ const platform = (overrides = {}) => ({
   credentialBrokerFunction: 'broker',
   sourceControlFunction: 'source-control',
   mcpSecretsPrefix: '/collaborative-ai-dlc/dev',
+  workerLogGroup: '/aidlc/worker/collaborative-ai-dlc-dev',
   ...overrides,
 });
 
@@ -106,6 +108,82 @@ describe('renderUserData', () => {
 
   it('restricts the environment file, which carries endpoints and table names', () => {
     expect(userData()).toContain('chmod 0600 /etc/aidlc-runner.env');
+  });
+
+  it('starts log shipping BEFORE the runner, so no early output is lost', () => {
+    // The instance is terminated when its stage ends, so whatever the runner said
+    // has to already be in CloudWatch. Start the agent afterwards and the earliest
+    // lines — registration, the claim, the first git call — are the ones at risk,
+    // and those are exactly the lines that explain a worker that never got going.
+    const script = userData();
+    expect(script.indexOf('fetch-config')).toBeLessThan(
+      script.indexOf('systemctl enable --now aidlc-runner.service'),
+    );
+  });
+
+  it('names a stream an operator can find from the environment and instance id', () => {
+    // The whole point: given a failed stage, an operator knows the environment and
+    // the worker id (which IS the instance id) and must be able to go straight to
+    // the log. A stream named anything else means searching every stream in the
+    // group by timestamp.
+    expect(userData()).toContain('"log_stream_name": "cpp-buildhost/{instance_id}"');
+    expect(userData()).toContain('"log_group_name": "/aidlc/worker/collaborative-ai-dlc-dev"');
+  });
+
+  it('ships the bootstrap log too, for the worker that never starts', () => {
+    // If the runner never came up there is no runner log at all, and cloud-init's
+    // account of why is the only evidence that will ever exist — on a disk that is
+    // about to be deleted.
+    expect(userData()).toContain('/var/log/aidlc-bootstrap.log');
+  });
+
+  it('never lets log shipping fail the boot', () => {
+    // A worker that cannot ship its log is hard to debug. A worker that refuses to
+    // boot is a stage that fails outright. Every failure in this block is a warning,
+    // including the AMI that has no agent in it at all — an operator's older image
+    // must keep placing stages.
+    const script = userData();
+    expect(script).toMatch(/if \[ -x \/opt\/aws\/amazon-cloudwatch-agent/);
+    expect(script).toMatch(/WARNING: no CloudWatch agent in this AMI/);
+    expect(script).toMatch(/WARNING: CloudWatch agent did not start/);
+  });
+
+  it('says so loudly when no log group is configured, rather than guessing one', () => {
+    // The instance role is scoped to the Terraform-owned group, so a made-up group
+    // name buys nothing but an AccessDenied inside the agent's own log with nobody
+    // watching. An unconfigured deployment still places stages — it just warns.
+    const script = renderUserData({
+      spec: spec(),
+      environmentId: 'cpp-buildhost',
+      revisionId: 'r-9',
+      platform: platform({ workerLogGroup: '' }),
+    });
+    expect(script).toMatch(/WARNING: no worker log group configured/);
+    expect(script).not.toContain('fetch-config');
+    expect(script).toContain('systemctl enable --now aidlc-runner.service');
+  });
+});
+
+describe('cloudWatchAgentConfig', () => {
+  it('sets no retention, because the group is Terraform-owned', () => {
+    // retention_in_days here would make the agent call logs:PutRetentionPolicy,
+    // which the instance role deliberately does not grant — the group and its
+    // retention belong to Terraform so no worker can create an unbounded one.
+    const json = JSON.stringify(
+      cloudWatchAgentConfig({ environmentId: 'e', platform: platform() }),
+    );
+    expect(json).not.toContain('retention_in_days');
+    expect(json).not.toContain('auto_create_group');
+  });
+
+  it('reads files, because the CloudWatch agent has no journald input on Linux', () => {
+    // This is why the unit's launcher tees to /var/log/aidlc/runner.log at all. If
+    // this ever becomes a journald config, the tee in provision-worker-ami.sh is
+    // dead weight and the file it writes is unread.
+    const config = cloudWatchAgentConfig({ environmentId: 'e', platform: platform() });
+    expect(config.logs.logs_collected.files.collect_list.map((f) => f.file_path)).toContain(
+      '/var/log/aidlc/runner.log',
+    );
   });
 });
 

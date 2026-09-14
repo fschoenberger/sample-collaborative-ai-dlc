@@ -3,9 +3,10 @@
 # it with CreateImage.
 #
 # Everything the worker needs lives in the image: the C++ toolchain, Node, the
-# agent CLIs, and the runner itself. user-data at launch only writes the
-# environment file and starts the service, so a stage is never waiting on a
-# download before it can begin.
+# agent CLIs, the CloudWatch agent, and the runner itself. user-data at launch only
+# writes configuration — the environment file and the log-shipping config, both of
+# which depend on the environment being launched — and starts the services, so a
+# stage is never waiting on a download before it can begin.
 #
 # Base: Fedora Cloud (dnf). Fedora because the toolchain versions are the point —
 # measured on 45-Prerelease: clang 23, cmake 4.3, libstdc++ 16, glibc 2.44, all
@@ -30,7 +31,8 @@ dnf -y install --setopt=install_weak_deps=False \
   cmake ninja-build \
   git curl unzip tar xz jq python3 \
   gcc-c++ libstdc++-devel \
-  perl-core zip pkgconf-pkg-config
+  perl-core zip pkgconf-pkg-config \
+  gnupg2
 
 # vcpkg. Pinned to a release tag so an AMI rebuild is reproducible; VCPKG_ROOT is
 # exported system-wide so a stage's own build scripts find it without being told.
@@ -126,6 +128,23 @@ export PATH="${RUNNER_ROOT}/node/bin:/usr/local/bin:\${PATH}"
 export VCPKG_ROOT=/opt/vcpkg
 export V2_WORKSPACE_DIR="\${V2_WORKSPACE_DIR:-/mnt/workspace}"
 mkdir -p "\${V2_WORKSPACE_DIR}"
+
+# The log goes to a FILE as well as the journal, because per-stage-ephemeral
+# terminates this instance the moment its stage ends and the journal dies with it —
+# leaving every failure unexplainable after the fact. The CloudWatch agent tails
+# this file; user-data points it here.
+#
+# tee, deliberately, and NOT StandardOutput=append: in the unit. systemd can send a
+# stream to the journal or to a file, not to both, and an operator who has an SSM
+# shell on a live worker reaches for \`journalctl -u aidlc-runner\` first. tee's own
+# stdout IS the journal, so both readers keep working.
+#
+# No rotation: an instance under per-stage-ephemeral lives for one stage against a
+# 100 GiB root volume, so the file cannot outgrow the disk before the disk is gone.
+LOG_DIR="\${LOGS_DIRECTORY:-/var/log/aidlc}"
+mkdir -p "\${LOG_DIR}"
+exec > >(tee -a "\${LOG_DIR}/runner.log") 2>&1
+
 exec "${RUNNER_ROOT}/node/bin/node" "${RUNNER_ROOT}/app/agentcore/worker.js"
 LAUNCHER
 chmod +x "${RUNNER_ROOT}/bin/aidlc-runner"
@@ -148,6 +167,12 @@ Type=simple
 # ~/.gitconfig and the credential helper the engine writes.
 Environment=HOME=/root
 EnvironmentFile=/etc/aidlc-runner.env
+# /var/log/aidlc, created by systemd on every start so the launcher's tee always
+# has somewhere to write. Declared here rather than mkdir'd in the AMI because a
+# directory baked into an image is one \`rm -rf /var/log/*\` away from being gone,
+# and then the CloudWatch agent tails a file nobody writes.
+LogsDirectory=aidlc
+LogsDirectoryMode=0755
 ExecStart=${RUNNER_ROOT}/bin/aidlc-runner
 Restart=on-failure
 RestartSec=5
@@ -165,6 +190,37 @@ dnf -y install "https://s3.${AWS_REGION:-eu-central-1}.amazonaws.com/amazon-ssm-
   dnf -y install amazon-ssm-agent || true
 systemctl enable amazon-ssm-agent || true
 
+# ── Log shipping ────────────────────────────────────────────────────────────
+# The Amazon CloudWatch agent, so a stage's log outlives the instance that wrote
+# it. Under per-stage-ephemeral the worker is terminated when its stage ends, and
+# until now the runner's journal — the only account of what the stage actually did —
+# was destroyed with it. A 14-minute hang that ended in
+# `stage_callback_failed: Callback timed out on heartbeat` could not be explained
+# at all, because the evidence no longer existed.
+#
+# The agent reads FILES, not journald: there is no journald input on Linux, and the
+# pattern AWS documents for a systemd service is exactly this one — have the service
+# write to a file and let the agent upload it. That is what the launcher's tee is
+# for. Installed but NOT configured or enabled here: the log group and stream carry
+# the environment id, which only exists at launch, so user-data writes the config
+# and starts the agent (see renderUserData in lambda/environments/ec2-launch-template.js).
+#
+# Pinned and signature-verified, like every other download in this script. There is
+# no published .sha256 for the RPM — only a detached GPG signature — so the check is
+# gpg against the vendor key rather than sha256sum.
+CWAGENT_VERSION=${CWAGENT_VERSION:-1.300072.0b1766}
+CWAGENT_BASE=https://amazoncloudwatch-agent.s3.amazonaws.com
+CWAGENT_URL="${CWAGENT_BASE}/redhat/${ARCH/x64/amd64}/${CWAGENT_VERSION}/amazon-cloudwatch-agent.rpm"
+curl -fsSLo /tmp/amazon-cloudwatch-agent.rpm "${CWAGENT_URL}"
+curl -fsSLo /tmp/amazon-cloudwatch-agent.rpm.sig "${CWAGENT_URL}.sig"
+curl -fsSLo /tmp/amazon-cloudwatch-agent.gpg "${CWAGENT_BASE}/assets/amazon-cloudwatch-agent.gpg"
+gpg --import /tmp/amazon-cloudwatch-agent.gpg
+gpg --verify /tmp/amazon-cloudwatch-agent.rpm.sig /tmp/amazon-cloudwatch-agent.rpm
+dnf -y install /tmp/amazon-cloudwatch-agent.rpm
+rm -f /tmp/amazon-cloudwatch-agent.rpm /tmp/amazon-cloudwatch-agent.rpm.sig /tmp/amazon-cloudwatch-agent.gpg
+# Assert the binary user-data guards on is actually where it expects it.
+test -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+
 # SELinux permissive: this is a build host that executes agent-driven compilers
 # and writes freely under the workspace. Enforcing would fight the workload
 # without protecting anything an operator relies on here.
@@ -180,6 +236,7 @@ cat > /etc/aidlc-worker-ami.json <<PROVENANCE
   "node": "$(node --version)",
   "claudeCode": "${CLAUDE_CODE_VERSION}",
   "opencode": "${OPENCODE_VERSION}",
+  "cloudwatchAgent": "${CWAGENT_VERSION}",
   "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 PROVENANCE

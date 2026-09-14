@@ -138,6 +138,10 @@ const launchTemplatePlatform = () => ({
   region: process.env.AWS_REGION,
   instanceProfileArn: process.env.EXECUTOR_INSTANCE_PROFILE_ARN,
   securityGroupId: process.env.EXECUTOR_SECURITY_GROUP_ID,
+  // Where the worker ships its runner log so it survives the instance. Not part of
+  // the EC2-configured check below: a deployment that has not applied the log group
+  // yet must still be able to place stages, it just cannot explain them afterwards.
+  workerLogGroup: process.env.WORKER_LOG_GROUP,
   valkeyHost: process.env.VALKEY_HOST,
   valkeyPort: process.env.VALKEY_PORT ?? '6379',
   schedulerFunction: process.env.SCHEDULER_FUNCTION,

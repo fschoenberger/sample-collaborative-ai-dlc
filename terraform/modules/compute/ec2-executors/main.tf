@@ -27,6 +27,12 @@ locals {
   source_control_function_arn    = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-source-control-${var.environment}"
   scheduler_function_arn         = "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-scheduler-${var.environment}"
 
+  # Built by hand rather than taken from the resource's `arn` attribute, because the
+  # two IAM forms differ by a suffix: CreateLogStream and PutLogEvents are authorized
+  # on `...:log-group:NAME:log-stream:STREAM`, DescribeLogStreams on the group itself.
+  # `NAME:*` covers the first; the bare `NAME` covers the second.
+  worker_log_group_arn = "arn:${local.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.worker.name}"
+
   orchestrator_function_arns = [
     "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-v2-orchestrator-${var.environment}",
     "arn:${local.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-v2-orchestrator-${var.environment}:*",
@@ -148,9 +154,20 @@ resource "aws_iam_role_policy" "executor" {
           ]
         },
         {
+          # Worker logs, which have to reach CloudWatch because the instance that
+          # wrote them is gone by the time anyone reads them: per-stage-ephemeral
+          # terminates the worker when its stage ends and the journal goes with it.
+          #
+          # DescribeLogStreams as well as the two writes — the CloudWatch agent
+          # looks a stream up before it appends to it, and without this the agent
+          # fails with AccessDenied and ships nothing at all.
+          #
+          # NO logs:CreateLogGroup, deliberately. The group is Terraform's, with a
+          # retention period on it, so a worker cannot conjure a group that keeps
+          # every byte forever and that nobody knows to look in.
           Effect   = "Allow"
-          Action   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"]
-          Resource = "arn:${local.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.executor.name}*"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
+          Resource = [local.worker_log_group_arn, "${local.worker_log_group_arn}:*"]
         },
       ],
       var.websocket_execution_arn != "" ? [
@@ -164,8 +181,25 @@ resource "aws_iam_role_policy" "executor" {
   })
 }
 
-resource "aws_cloudwatch_log_group" "executor" {
-  name              = "/aidlc/${var.project_name}-executor-${var.environment}"
-  retention_in_days = var.environment == "prod" ? 30 : 7
+# ---------------------------------------------------------------------------
+# Where a worker's log lives after the worker does not.
+#
+# ONE group per deployment, with the environment id in the STREAM name rather than
+# in the group name. A group per environment would read better, but environments are
+# runtime objects — an operator creates them through the API, they live in the
+# environment registry table, and Terraform has no way to enumerate them. The only
+# way to get a group per environment is to let the instance create its own, which
+# means granting logs:CreateLogGroup and accepting groups with no retention that
+# accumulate forever. Predictability is not lost: streams are
+# `<environmentId>/<instanceId>`, so an operator filters by environment prefix and
+# gets exactly the workers of that environment.
+#
+# Terraform owning the group is also what makes the grant above tight.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "worker" {
+  name = "/aidlc/worker/${var.project_name}-${var.environment}"
+  # A worker log is read while debugging the stage that wrote it, or within a day or
+  # two of it. Two weeks in dev is generous for that and keeps the bill bounded.
+  retention_in_days = var.environment == "prod" ? 30 : 14
   tags              = var.tags
 }

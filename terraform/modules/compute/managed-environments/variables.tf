@@ -123,6 +123,15 @@ variable "executor_security_group_id" {
   default     = ""
 }
 
+# Empty means "do not ship worker logs" — user-data then says so in the bootstrap
+# log rather than pointing the CloudWatch agent at a group the instance role has no
+# grant for, which would fail as AccessDenied with nothing to explain it.
+variable "worker_log_group_name" {
+  description = "CloudWatch log group a worker ships its runner log to; empty disables shipping"
+  type        = string
+  default     = ""
+}
+
 variable "valkey_host" {
   description = "Valkey endpoint a worker connects to for its job queue"
   type        = string

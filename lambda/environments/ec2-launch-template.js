@@ -29,7 +29,11 @@ import { CreateLaunchTemplateCommand } from '@aws-sdk/client-ec2';
 
 // Bumped when the generated user-data changes in a way existing revisions should
 // not silently inherit. Recorded on the revision alongside the template id.
-export const LAUNCH_TEMPLATE_CONTRACT_VERSION = 1;
+// Bumped to 2 when workers started shipping their log to CloudWatch. A published
+// revision's template is frozen, so a revision built before this still boots a
+// worker whose journal dies with the instance — and this is the field that says
+// which revisions those are, without diffing base64 user-data to find out.
+export const LAUNCH_TEMPLATE_CONTRACT_VERSION = 2;
 
 const shellQuote = (value) => `'${String(value ?? '').replaceAll("'", `'\\''`)}'`;
 
@@ -79,6 +83,93 @@ export const runnerEnvironment = ({ spec, environmentId, revisionId, platform })
   AIDLC_BOOTSTRAP_TIMEOUT_SECONDS: String(spec.bootstrapTimeoutSeconds ?? 0),
 });
 
+// Where the CloudWatch agent lives in the AMI, and what it reads. Fixed paths, all
+// three of them created by scripts/provision-worker-ami.sh or by the units it
+// installs — nothing here is downloaded at boot.
+const CWAGENT_CTL = '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl';
+const CWAGENT_CONFIG = '/etc/aidlc-cloudwatch-agent.json';
+const RUNNER_LOG = '/var/log/aidlc/runner.log';
+const BOOTSTRAP_LOG = '/var/log/aidlc-bootstrap.log';
+
+/**
+ * The CloudWatch agent config for one worker.
+ *
+ * Templated at boot rather than baked into the AMI because the stream carries the
+ * environment id, and an image is shared by every environment that names it.
+ *
+ * `{instance_id}` is the AGENT's placeholder, not ours: it resolves it from IMDS
+ * itself, so user-data does not have to fetch a token and query the metadata
+ * service just to name a stream.
+ *
+ * The bootstrap log ships too, and that is the half that matters when a worker
+ * never appears at all: if the runner did not start there is no runner log to read,
+ * and cloud-init's account of why is the only evidence there will ever be.
+ *
+ * No `retention_in_days` here on purpose — retention belongs to the Terraform-owned
+ * group, and setting it here would demand logs:PutRetentionPolicy on every worker.
+ */
+export const cloudWatchAgentConfig = ({ environmentId, platform }) => ({
+  logs: {
+    logs_collected: {
+      files: {
+        collect_list: [
+          {
+            file_path: RUNNER_LOG,
+            log_group_name: platform.workerLogGroup,
+            log_stream_name: `${environmentId}/{instance_id}`,
+            timezone: 'UTC',
+          },
+          {
+            file_path: BOOTSTRAP_LOG,
+            log_group_name: platform.workerLogGroup,
+            log_stream_name: `${environmentId}/{instance_id}/bootstrap`,
+            timezone: 'UTC',
+          },
+        ],
+      },
+    },
+  },
+});
+
+/**
+ * The user-data fragment that starts log shipping.
+ *
+ * NEVER fatal, unlike the missing-runner check above it. A worker that cannot ship
+ * its log is a worker an operator will struggle to debug; a worker that refuses to
+ * boot is a stage that fails outright. The second is strictly worse, so every
+ * failure here is a warning and the stage runs anyway.
+ *
+ * Guarded on the agent binary for the same reason `HOME` is set in two places: an
+ * operator's existing AMI predates this change, and an image without the agent must
+ * keep working rather than fail on a path that is not there.
+ */
+const renderLogShipping = ({ environmentId, platform }) => {
+  if (!platform.workerLogGroup) {
+    return `
+echo "[aidlc] WARNING: no worker log group configured; this worker's log will be destroyed with the instance" >&2
+`;
+  }
+  const config = JSON.stringify(cloudWatchAgentConfig({ environmentId, platform }), null, 2);
+  return `
+# Ship the runner's log to CloudWatch BEFORE the runner starts, because this
+# instance is terminated the moment its stage ends (per-stage-ephemeral) and the
+# journal is destroyed with it. Group and stream are fixed and greppable:
+#   ${platform.workerLogGroup} / ${environmentId}/<instanceId>
+if [ -x ${CWAGENT_CTL} ]; then
+  cat > ${CWAGENT_CONFIG} <<'AIDLC_CWAGENT'
+${config}
+AIDLC_CWAGENT
+  # HOME, because it is unset here and Go's os.UserHomeDir fails without it. The
+  # agent's own translator reads the shared AWS config on start-up.
+  if ! HOME=/root ${CWAGENT_CTL} -a fetch-config -m ec2 -s -c file:${CWAGENT_CONFIG}; then
+    echo "[aidlc] WARNING: CloudWatch agent did not start; this stage's log will not outlive the instance" >&2
+  fi
+else
+  echo "[aidlc] WARNING: no CloudWatch agent in this AMI; rebuild it with scripts/provision-worker-ami.sh" >&2
+fi
+`;
+};
+
 /**
  * Cloud-init user-data.
  *
@@ -92,6 +183,7 @@ export const renderUserData = ({ spec, environmentId, revisionId, platform }) =>
     .map(([key, value]) => `${key}=${value}`)
     .join('\n');
   const workspace = spec.workspacePath ?? '/mnt/workspace';
+  const logShipping = renderLogShipping({ environmentId, platform });
 
   return `#!/usr/bin/env bash
 # Managed by AI-DLC. Starts the stage worker that is already installed in the AMI.
@@ -114,7 +206,7 @@ cat > /etc/aidlc-runner.env <<'AIDLC_ENV'
 ${envLines}
 AIDLC_ENV
 chmod 0600 /etc/aidlc-runner.env
-
+${logShipping}
 systemctl daemon-reload
 systemctl enable --now aidlc-runner.service
 
@@ -238,6 +330,7 @@ export const createLaunchTemplateForRevision = async ({
 export default {
   LAUNCH_TEMPLATE_CONTRACT_VERSION,
   runnerEnvironment,
+  cloudWatchAgentConfig,
   renderUserData,
   launchTemplateInput,
   createLaunchTemplateForRevision,

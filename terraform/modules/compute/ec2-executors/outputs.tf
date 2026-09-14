@@ -9,6 +9,6 @@ output "role_arn" {
 }
 
 output "log_group_name" {
-  description = "Worker log group"
-  value       = aws_cloudwatch_log_group.executor.name
+  description = "Log group every worker ships its runner log to; the environments lambda templates it into the CloudWatch agent config in user-data"
+  value       = aws_cloudwatch_log_group.worker.name
 }
