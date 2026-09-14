@@ -26,8 +26,8 @@ import { EC2Client, CreateFleetCommand, TerminateInstancesCommand } from '@aws-s
 export const MANAGED_TAG = 'aidlc:scheduler';
 
 /**
- * The CreateFleet idempotency token: a HASH of the worker id, never a truncation
- * of it.
+ * The CreateFleet idempotency token: a HASH of the worker id AND the placement
+ * generation, never a truncation of either.
  *
  * EC2 caps a client token at 64 characters. `worker-${workerId}` blew that,
  * because the caller's id already carries an executionId plus a stageInstanceId.
@@ -36,9 +36,28 @@ export const MANAGED_TAG = 'aidlc:scheduler';
  * and hand both of them the same instance. Hashing is fixed-length and keeps the
  * property the token exists for — a retried provision for one worker must not
  * produce a second instance.
+ *
+ * `generation` is what makes the token unique per PLACEMENT rather than per stage
+ * attempt, and it is not optional. The worker id is
+ * `p-<executionId>-<stageInstanceId>-<attempt>`, which is identical for two
+ * genuinely different placements of the same attempt number — a resume-after-park
+ * is attempt 2, and so is a later rewind retry of that same stage. CreateFleet's
+ * idempotency window is 24 HOURS, so the second call got the first call's response
+ * replayed: a `fleetInstanceSet` naming an instance that had already been
+ * terminated, with `errorSet` empty and no error anywhere to notice. The scheduler
+ * wrote a worker row for a dead instance, the orchestrator suspended on a callback
+ * nobody would ever complete, and the run hung until the 15-minute heartbeat.
+ * Observed exactly that, twice over the same stage instance.
+ *
+ * The orchestrator run id is the right generation: the durable SDK re-invokes a
+ * retried step with the same run id, so a genuine retry still dedupes, while every
+ * relaunch (rewind, retry-from-failed) mints a new one and therefore places afresh.
  */
-export const clientTokenFor = (workerId) =>
-  `worker-${createHash('sha256').update(String(workerId)).digest('hex').slice(0, 40)}`;
+export const clientTokenFor = (workerId, generation) =>
+  `worker-${createHash('sha256')
+    .update(`${String(workerId)}|${String(generation ?? '')}`)
+    .digest('hex')
+    .slice(0, 40)}`;
 
 const fleetTags = ({
   projectName,
@@ -144,7 +163,7 @@ export const createEc2Provisioner = ({ client = new EC2Client({}), env = process
    * is what lets it be pinned per revision at all. The caller registers the row
    * under the returned instanceId.
    */
-  async provision({ target, workerId, executionId, subnetIds }) {
+  async provision({ target, workerId, executionId, subnetIds, generation = null }) {
     const launchSpec = target.launchSpec ?? {};
     const spot = launchSpec.purchaseOption === 'spot';
     const command = new CreateFleetCommand({
@@ -191,9 +210,10 @@ export const createEc2Provisioner = ({ client = new EC2Client({}), env = process
           }),
         },
       ],
-      // Our own idempotency: a retried provision for the same worker must not
-      // produce a second instance.
-      ClientToken: clientTokenFor(workerId),
+      // Our own idempotency: a retried provision for the same worker WITHIN one
+      // orchestrator run must not produce a second instance. Across runs it must,
+      // which is what `generation` carries — see clientTokenFor.
+      ClientToken: clientTokenFor(workerId, generation),
     });
     const result = await client.send(command);
     const instanceId = result.Instances?.[0]?.InstanceIds?.[0] ?? null;

@@ -802,6 +802,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         stage,
         unitSlug,
         sectionIndex,
+        // Identifies THIS orchestrator run to the scheduler, so a placement is
+        // idempotent per run rather than per stage attempt (see runStage).
+        runId,
         stageInstanceId: unitSlug
           ? planStageInstanceId(namespace, stage.stageId, unitSlug, sectionIndex)
           : (stage.stageInstanceId ??
@@ -1677,6 +1680,14 @@ const runStage = async (
     // checkout are in that instance's memory and disk.
     resumeWorkerId: heldWorkerId = null,
     credentialBinding = null,
+    // This orchestrator run. Passed to the scheduler as the placement generation
+    // for the CreateFleet client token: `p-<exec>-<stageInstance>-<attempt>` is NOT
+    // unique across relaunches (a resume-after-park and a later rewind retry are
+    // both attempt 2), and CreateFleet dedupes on that token for 24 hours — so the
+    // second placement silently got the first one's already-terminated instance
+    // replayed back, with no error to notice, and the stage hung on a callback
+    // nobody could complete.
+    runId = null,
   },
 ) => {
   // The attempt key names every durable identity for this stage attempt. It
@@ -1786,6 +1797,7 @@ const runStage = async (
           // null for AgentCore (its session is released on park and re-materialized)
           // and for `release`, where the instance is already gone.
           resumeWorkerId: heldWorkerId,
+          runId,
           payload: stagePayload(),
         })
       : invokeRuntime(stagePayload(), sessionId),

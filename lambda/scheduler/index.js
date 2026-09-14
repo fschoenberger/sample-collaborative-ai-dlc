@@ -103,6 +103,9 @@ export const createScheduler = ({
     target,
     stageCallbackId,
     resumeWorkerId = null,
+    // The orchestrator run this placement belongs to. Folded into the CreateFleet
+    // client token so a retried step dedupes but a relaunch places afresh.
+    runId = null,
     projectId = null,
     credentialBinding = null,
     payload = {},
@@ -193,6 +196,7 @@ export const createScheduler = ({
         workerId: provisionalWorkerId({ executionId, stageInstanceId, attempt }),
         executionId,
         subnetIds,
+        generation: runId,
       });
     } catch (error) {
       // LOG it. A provisioning failure used to be returned as a value and never
