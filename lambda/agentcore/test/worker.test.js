@@ -70,6 +70,7 @@ describe.skipIf(!host)('worker', () => {
       busy,
       blockMs: 50,
       heartbeatMs: 60_000,
+      busyPollMs: 10,
       logger: { error: () => {}, log: () => {} },
     });
     return worker;

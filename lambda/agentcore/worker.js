@@ -117,6 +117,9 @@ export const createWorker = ({
   // which removes the race rather than narrowing it. A pooling strategy would raise
   // this and would then also need the draining check this makes unnecessary.
   maxJobs = Number(process.env.AIDLC_MAX_JOBS || 1),
+  // How often to re-check whether a detached stage job has finished. Injectable so a
+  // test can drive the drain without waiting real seconds for it.
+  busyPollMs = BUSY_POLL_MS,
 }) => {
   const registry = createRegistry({ client, clock });
   let running = false;
@@ -140,7 +143,7 @@ export const createWorker = ({
   const drainBusy = async () => {
     if (typeof busy?.count !== 'number') return;
     while (running && busy.count > 1) {
-      await new Promise((resolve) => setTimeout(resolve, BUSY_POLL_MS));
+      await new Promise((resolve) => setTimeout(resolve, busyPollMs));
     }
   };
 
