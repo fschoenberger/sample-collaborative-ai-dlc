@@ -413,13 +413,24 @@ export const createScheduler = ({
     }
     if (!execution) return false;
     if (!LIVE_EXECUTION_STATUSES.has(execution.status)) return false;
-    const stages = execution.process?.stages ?? [];
-    if (!Array.isArray(stages) || stages.length === 0) return true;
-    return stages.some(
-      (stage) =>
-        stage?.state === 'RUNNING' &&
-        (!worker.stageInstanceId || stage.stageInstanceId === worker.stageInstanceId),
-    );
+    const stages = Array.isArray(execution.process?.stages) ? execution.process.stages : [];
+    // No rows yet — the run is live but has not written its plan. Unknown, so spare.
+    if (stages.length === 0) return true;
+    // Judge THIS worker's own stage, not the execution as a whole. Parallel unit lanes
+    // mean another lane's stage being RUNNING says nothing about whether this machine
+    // is still needed: sparing on that would leak a worker per lane for the whole run.
+    if (worker.stageInstanceId) {
+      const own = stages.find((stage) => stage?.stageInstanceId === worker.stageInstanceId);
+      // Its row is ABSENT. That is not evidence the work is done — a rewind rewrites
+      // the stage list, and a row can be missing while the machine is mid-build. The
+      // reap that motivated this guard killed a stage 5 minutes in; unknown must mean
+      // spare, and the lifetime cap remains the backstop.
+      if (!own) return true;
+      return own.state === 'RUNNING';
+    }
+    // No stage identity on the row at all (an older worker): fall back to the whole
+    // execution, which is the conservative reading.
+    return stages.some((stage) => stage?.state === 'RUNNING');
   };
 
   // Every instance this scheduler owns that is currently alive. One call, shared by

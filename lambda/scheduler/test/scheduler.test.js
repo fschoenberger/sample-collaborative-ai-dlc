@@ -540,9 +540,15 @@ describe.skipIf(!host)('scheduler', () => {
       const scheduler = schedulerWith(provisioners, {
         describeInstances: noInstances,
         clock: () => now,
+        // The row the orchestrator really writes: identified by stageInstanceId,
+        // which is what the worker row carries too.
         readExecution: async () => ({
           status: 'RUNNING',
-          process: { stages: [{ stageId: 'reverse-engineering', state: 'RUNNING' }] },
+          process: {
+            stages: [
+              { stageId: 'reverse-engineering', stageInstanceId: 's-1', state: 'RUNNING' },
+            ],
+          },
         }),
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
@@ -556,6 +562,62 @@ describe.skipIf(!host)('scheduler', () => {
       expect(provisioners.ec2Stub.terminate).not.toHaveBeenCalled();
     });
 
+    it('spares a reap candidate whose stage row is absent from a live execution', async () => {
+      // A rewind rewrites the stage list, so a worker's row can be missing while its
+      // machine is mid-build. Absent is UNKNOWN, not done.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        readExecution: async () => ({
+          status: 'RUNNING',
+          process: { stages: [{ stageId: 'other', stageInstanceId: 's-other', state: 'RUNNING' }] },
+        }),
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+
+      expect((await scheduler.reconcile({ environmentIds: [environmentId] })).idle).not.toContain(
+        workerId,
+      );
+    });
+
+    it('reaps a worker whose OWN stage finished even while another lane runs', async () => {
+      // The other half: parallel unit lanes mean another lane's RUNNING stage says
+      // nothing about this machine. Sparing on that would leak a worker per lane for
+      // the whole run, each billing to its lifetime cap.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+        readExecution: async () => ({
+          status: 'RUNNING',
+          process: {
+            stages: [
+              { stageId: 'mine', stageInstanceId: 's-1', state: 'SUCCEEDED' },
+              { stageId: 'other-lane', stageInstanceId: 's-other', state: 'RUNNING' },
+            ],
+          },
+        }),
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+
+      expect((await scheduler.reconcile({ environmentIds: [environmentId] })).idle).toContain(
+        workerId,
+      );
+    });
+
     it('reaps an idle worker once its execution has finished', async () => {
       const environmentId = nextEnv();
       const provisioners = stubProvisioners();
@@ -565,7 +627,11 @@ describe.skipIf(!host)('scheduler', () => {
         clock: () => now,
         readExecution: async () => ({
           status: 'SUCCEEDED',
-          process: { stages: [{ stageId: 'reverse-engineering', state: 'SUCCEEDED' }] },
+          process: {
+            stages: [
+              { stageId: 'reverse-engineering', stageInstanceId: 's-1', state: 'SUCCEEDED' },
+            ],
+          },
         }),
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
