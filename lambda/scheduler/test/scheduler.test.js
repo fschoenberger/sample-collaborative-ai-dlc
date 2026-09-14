@@ -537,8 +537,9 @@ describe.skipIf(!host)('scheduler', () => {
       const provisioners = stubProvisioners();
       const scheduler = schedulerWith(provisioners, {
         describeInstances: noInstances,
-        // No item for the dead execution; the live one is CREATED.
-        processTable: 'stub-table',
+        // The execution is ABSENT — what a deleted intent looks like, and the state
+        // the five real corpses were in. Distinct from an unreadable table below.
+        readExecution: async () => null,
       });
       await scheduler.enqueueStage(
         stageRequest(ec2Target(environmentId), { executionId: 'gone-1', stageInstanceId: 's-dead' }),
@@ -565,7 +566,9 @@ describe.skipIf(!host)('scheduler', () => {
       const provisioners = stubProvisioners();
       const scheduler = schedulerWith(provisioners, {
         describeInstances: noInstances,
-        processTable: undefined, // makes the GetItem throw
+        readExecution: async () => {
+          throw new Error('ProvisionedThroughputExceededException');
+        },
       });
       await scheduler.enqueueStage(
         stageRequest(ec2Target(environmentId), { executionId: 'live-1', stageInstanceId: 's-live' }),

@@ -103,6 +103,16 @@ export const createScheduler = ({
   issueAgentCredentialGrantFn = (claims) => issueAgentCredentialGrant(ssm, claims),
   clock = () => Date.now(),
   processTable = process.env.V2_PROCESS_TABLE,
+  // The execution META read behind the queue sweep. Injected so the sweep can be
+  // tested against a table that isn't there — the distinction that matters is
+  // "execution absent" (drop the entry) versus "could not read" (keep it), and a
+  // stubbed table name collapses both into a thrown error.
+  readExecution = async (executionId) => {
+    const result = await ddb.send(
+      new GetCommand({ TableName: processTable, Key: executionMetaKey(executionId) }),
+    );
+    return result?.Item ?? null;
+  },
 } = {}) => {
   const enqueueStage = async ({
     executionId,
@@ -544,13 +554,7 @@ export const createScheduler = ({
     if (!job.executionId) return null;
     let execution;
     try {
-      const result = await ddb.send(
-        new GetCommand({
-          TableName: processTable,
-          Key: executionMetaKey(job.executionId),
-        }),
-      );
-      execution = result?.Item ?? null;
+      execution = await readExecution(job.executionId);
     } catch (error) {
       // A read failure is NOT evidence of a dead execution. Keep the entry.
       console.error('[scheduler] could not read execution for queued job', {
