@@ -126,6 +126,18 @@ export const dispatchInvocation = async ({
     // instead of turning the response into an SDK transport exception.
     return { statusCode: 200, body: { ...result, command, at: now() } };
   } catch (e) {
+    // LOG it. This return value is the ONLY record of the failure, and on an EC2
+    // worker nobody reads it: the queue carries work in and the verdict travels on
+    // the durable callback, so a 500 body is discarded and the exception vanished
+    // entirely — a stage that died here left two lines in the runner log and no
+    // reason in any of them. Over HTTP the body at least reached the orchestrator,
+    // which is why this was invisible until the same handler ran off a queue.
+    console.error('[agentcore] command threw', {
+      command,
+      error: e?.message,
+      code: e?.code ?? null,
+      stack: e?.stack,
+    });
     return { statusCode: 500, body: { error: e.message, command } };
   } finally {
     busy?.leave();

@@ -162,7 +162,23 @@ export const createWorker = ({
         // credentials, and every authenticated stage would run unauthenticated.
         prepareInvocation,
       });
-      await registry.setJobState(job.jobId, result?.statusCode === 200 ? 'DONE' : 'FAILED');
+      const ok = result?.statusCode === 200;
+      if (!ok) {
+        // Say WHY, with the body. `setJobState(FAILED)` on its own records a state
+        // and discards the only description of the failure that exists — the
+        // dispatch response body — because a queue-delivered job has no caller to
+        // return it to.
+        logger.error?.('[worker] job returned a failure', {
+          jobId: job.jobId,
+          statusCode: result?.statusCode ?? null,
+          body: result?.body,
+        });
+      }
+      await registry.setJobState(
+        job.jobId,
+        ok ? 'DONE' : 'FAILED',
+        ok ? {} : { failureReason: result?.body?.error ?? `http_${result?.statusCode}` },
+      );
       return result;
     } catch (error) {
       logger.error?.('[worker] job failed', { jobId: job.jobId, error: error?.message });
@@ -219,6 +235,25 @@ export const createWorker = ({
           const job = await registry.getJob(map.jobId);
           if (!job) {
             logger.error?.('[worker] claimed an entry with no job row', { jobId: map.jobId });
+            await registry.ackJob({ environmentId, entryId }).catch(() => {});
+            continue;
+          }
+          // A job somebody already dealt with must NOT consume this worker's
+          // allotment. XREADGROUP '>' hands out the OLDEST undelivered entry and
+          // per-stage-ephemeral allows exactly one job, so one stale entry at the
+          // head of the queue silently eats the whole allotment: the worker runs
+          // the corpse, goes idle, stops claiming, and the job the orchestrator is
+          // waiting on is never picked up. The stage then hangs to its heartbeat
+          // timeout with no error anywhere. Observed with five dead entries queued
+          // ahead of a live one.
+          //
+          // `continue` rather than `break`: drop it and keep asking, so one worker
+          // clears as much debris as stands between it and real work.
+          if (job.state && job.state !== 'PENDING') {
+            logger.error?.('[worker] dropping a queue entry whose job is not pending', {
+              jobId: job.jobId,
+              state: job.state,
+            });
             await registry.ackJob({ environmentId, entryId }).catch(() => {});
             continue;
           }

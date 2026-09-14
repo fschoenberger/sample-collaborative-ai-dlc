@@ -526,6 +526,59 @@ describe.skipIf(!host)('scheduler', () => {
       expect(result.orphans).toEqual(['i-rowless']);
     });
 
+    it('drops a queued entry whose execution no longer exists', async () => {
+      // The liveness bug, not tidiness. XREADGROUP '>' hands out the OLDEST
+      // undelivered entry and per-stage-ephemeral allows one job per worker, so a
+      // single dead entry at the head of the queue eats the whole allotment of the
+      // next worker to boot — it runs the corpse, goes idle, stops claiming, and the
+      // job the orchestrator is waiting on is never claimed at all. Seen with five
+      // dead entries queued ahead of one live job; the stage hung to its heartbeat.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        // No item for the dead execution; the live one is CREATED.
+        processTable: 'stub-table',
+      });
+      await scheduler.enqueueStage(
+        stageRequest(ec2Target(environmentId), { executionId: 'gone-1', stageInstanceId: 's-dead' }),
+      );
+
+      const before = await registry.listQueued(environmentId);
+      expect(before.map((e) => e.jobId)).toContain('job-gone-1-s-dead-1');
+
+      // The execution is absent from the table, which is what a deleted intent looks
+      // like — and is exactly the state the five real corpses were in.
+      const dropped = await scheduler.sweepQueue({ environmentId });
+
+      expect(dropped).toContain('job-gone-1-s-dead-1');
+      expect((await registry.listQueued(environmentId)).map((e) => e.jobId)).not.toContain(
+        'job-gone-1-s-dead-1',
+      );
+    });
+
+    it('leaves a queued entry alone when the execution cannot be read', async () => {
+      // A read failure is not evidence of a dead execution. Dropping a live job
+      // strands its stage exactly as badly as keeping a dead one, so the sweep must
+      // fail CLOSED — keep the entry.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        processTable: undefined, // makes the GetItem throw
+      });
+      await scheduler.enqueueStage(
+        stageRequest(ec2Target(environmentId), { executionId: 'live-1', stageInstanceId: 's-live' }),
+      );
+
+      const dropped = await scheduler.sweepQueue({ environmentId });
+
+      expect(dropped).toEqual([]);
+      expect((await registry.listQueued(environmentId)).map((e) => e.jobId)).toContain(
+        'job-live-1-s-live-1',
+      );
+    });
+
     it('spares a young instance that may simply not have registered yet', async () => {
       const environmentId = nextEnv();
       const provisioners = stubProvisioners();

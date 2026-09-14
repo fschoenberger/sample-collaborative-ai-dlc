@@ -390,6 +390,37 @@ export const createRegistry = ({ client, clock = nowMs }) => {
   // says "this consumer is done with it" — so a finished job would still occupy the
   // queue. XDEL is what actually reclaims it; MAXLEN on the XADD is the backstop for
   // entries nobody ever acks.
+  /**
+   * Every UNDELIVERED entry still sitting on an environment's queue.
+   *
+   * XPENDING/XAUTOCLAIM cannot see these: those work on the pending-entries list,
+   * i.e. entries a consumer already claimed. An entry nobody ever read is invisible
+   * to both, which is exactly how the queue silently accumulated jobs for
+   * executions that had since been DELETED — and why the reconciler, which only
+   * ever looked at the PEL, reported a clean fleet while the queue held five
+   * corpses.
+   */
+  const listQueued = async (environmentId) => {
+    const entries = await client.xrange(environmentQueueKey(environmentId), '-', '+');
+    return (entries ?? []).map(([entryId, fields]) => {
+      const map = {};
+      for (let i = 0; i < fields.length; i += 2) map[fields[i]] = fields[i + 1];
+      return { entryId, jobId: map.jobId ?? null };
+    });
+  };
+
+  /**
+   * Drop entries from an environment queue outright.
+   *
+   * XACK would not do: it only clears the PEL, and an entry that was never
+   * delivered has no PEL record — XACK on it is a no-op and the entry stays in the
+   * stream forever, waiting to be handed to the next worker that asks.
+   */
+  const dropQueued = async ({ environmentId, entryIds }) => {
+    if (!entryIds?.length) return 0;
+    return client.xdel(environmentQueueKey(environmentId), ...entryIds);
+  };
+
   const ackJob = async ({ environmentId, entryId }) => {
     const key = environmentQueueKey(environmentId);
     const pipeline = client.pipeline();
@@ -436,6 +467,8 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     inFlightCount,
     fleetView,
     claimAbandoned,
+    listQueued,
+    dropQueued,
     ackJob,
   };
 };

@@ -33,6 +33,9 @@
 
 import { EC2Client, DescribeInstancesCommand } from '@aws-sdk/client-ec2';
 import { SSMClient } from '@aws-sdk/client-ssm';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { executionMetaKey } from '../shared/v2-process-keys.js';
 import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
 import { createRegistry } from '../shared/valkey/registry.js';
 import { getClient } from '../shared/valkey/client.js';
@@ -41,6 +44,12 @@ import { MANAGED_TAG, createEc2Provisioner, provisionerFor } from './provisioner
 
 const ec2 = new EC2Client({});
 const ssm = new SSMClient({});
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+
+// Execution statuses whose queued work is still worth running. Anything else — and
+// an execution that has been DELETED outright, which reads as no item at all — has
+// no business holding a queue entry.
+const LIVE_EXECUTION_STATUSES = new Set(['CREATED', 'RUNNING', 'WAITING']);
 
 const SUBNET_IDS = () =>
   (process.env.EXECUTOR_SUBNET_IDS ?? '')
@@ -93,6 +102,7 @@ export const createScheduler = ({
   workerIdleMs = WORKER_IDLE_MS(),
   issueAgentCredentialGrantFn = (claims) => issueAgentCredentialGrant(ssm, claims),
   clock = () => Date.now(),
+  processTable = process.env.V2_PROCESS_TABLE,
 } = {}) => {
   const enqueueStage = async ({
     executionId,
@@ -467,7 +477,94 @@ export const createScheduler = ({
     }
 
     const orphans = await reapOrphans({ environmentIds });
-    return { ok: true, environmentIds, abandoned, timedOut, expired, idle, orphans };
+    const staleQueued = [];
+    for (const environmentId of environmentIds) {
+      staleQueued.push(...(await sweepQueue({ environmentId })));
+    }
+    return {
+      ok: true,
+      environmentIds,
+      abandoned,
+      timedOut,
+      expired,
+      idle,
+      orphans,
+      staleQueued,
+    };
+  };
+
+  /**
+   * Drop queue entries whose work can never run.
+   *
+   * This is not tidiness, it is a liveness fix. A worker claims with XREADGROUP
+   * '>', which hands out the OLDEST undelivered entry, and per-stage-ephemeral gives
+   * each worker an allotment of exactly one job. So a single dead entry at the head
+   * of the queue consumes the entire allotment of the next worker to boot: it runs
+   * the corpse, marks itself idle, stops claiming, and the job the orchestrator is
+   * actually waiting on is never picked up. The stage then hangs until its callback
+   * heartbeat expires, with no error anywhere.
+   *
+   * Observed exactly that: the queue for one environment held six entries, five of
+   * them belonging to executions that had since been deleted, and a fresh worker
+   * spent its one job on the oldest while the real job sat behind it.
+   *
+   * Nothing removed them before, because the only remover was `ackJob` on the happy
+   * path — a stage that failed before a worker ever claimed it (provision refused,
+   * run cancelled, run rewound) left its entry behind forever, and neither
+   * XPENDING nor XAUTOCLAIM can see an entry that was never delivered.
+   */
+  const sweepQueue = async ({ environmentId }) => {
+    const queued = await registry.listQueued(environmentId);
+    if (queued.length === 0) return [];
+    const doomed = [];
+    for (const entry of queued) {
+      const reason = await unrunnableReason(entry.jobId);
+      if (reason) doomed.push({ ...entry, reason });
+    }
+    if (doomed.length === 0) return [];
+    await registry.dropQueued({ environmentId, entryIds: doomed.map((d) => d.entryId) });
+    console.error('[scheduler] dropped unrunnable queue entries', {
+      environmentId,
+      dropped: doomed.map((d) => `${d.jobId ?? d.entryId}: ${d.reason}`),
+    });
+    return doomed.map((d) => d.jobId ?? d.entryId);
+  };
+
+  // Why a queued job can never run, or null when it still can. Deliberately
+  // conservative: anything this cannot positively rule out is left alone, because
+  // dropping a live job silently strands a stage exactly as badly as keeping a dead
+  // one does.
+  const unrunnableReason = async (jobId) => {
+    if (!jobId) return 'no_job_id';
+    const job = await registry.getJob(jobId);
+    if (!job) return 'job_row_gone';
+    // A job the scheduler just enqueued is PENDING. DONE/FAILED/ABANDONED means a
+    // worker already dealt with it and only the stream entry outlived the work.
+    if (job.state && job.state !== 'PENDING') return `job_${String(job.state).toLowerCase()}`;
+    if (!job.executionId) return null;
+    let execution;
+    try {
+      const result = await ddb.send(
+        new GetCommand({
+          TableName: processTable,
+          Key: executionMetaKey(job.executionId),
+        }),
+      );
+      execution = result?.Item ?? null;
+    } catch (error) {
+      // A read failure is NOT evidence of a dead execution. Keep the entry.
+      console.error('[scheduler] could not read execution for queued job', {
+        jobId,
+        executionId: job.executionId,
+        error: error?.message,
+      });
+      return null;
+    }
+    if (!execution) return 'execution_deleted';
+    if (!LIVE_EXECUTION_STATUSES.has(execution.status)) {
+      return `execution_${String(execution.status).toLowerCase()}`;
+    }
+    return null;
   };
 
   // EC2 is the authority on which instances exist. Anything running with our tag
@@ -530,6 +627,7 @@ export const createScheduler = ({
     issueGrant,
     reconcile,
     reapOrphans,
+    sweepQueue,
     environmentsToSweep,
   };
 };
