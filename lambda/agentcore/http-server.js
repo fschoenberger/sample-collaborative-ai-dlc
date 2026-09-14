@@ -80,6 +80,14 @@ export const createBusyTracker = () => {
     get status() {
       return busy > 0 ? 'HealthyBusy' : 'Healthy';
     },
+    // The count itself, for a caller that must WAIT for the detached work rather
+    // than merely report on it. An EC2 worker needs this: `run-stage-start` returns
+    // `{ accepted: true }` in milliseconds while the stage runs on detached, and the
+    // worker's registry row has to stay BUSY for the stage's real lifetime or the
+    // reconciler's idle reap terminates the instance mid-build.
+    get count() {
+      return busy;
+    },
   };
 };
 

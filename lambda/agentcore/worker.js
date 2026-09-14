@@ -37,6 +37,8 @@ import { commandDefinition } from './command-registry.js';
 const IMDS_BASE = 'http://169.254.169.254';
 const HEARTBEAT_MS = 30_000;
 const CLAIM_BLOCK_MS = 5_000;
+// How often to re-check whether a detached stage job has finished.
+const BUSY_POLL_MS = 2_000;
 
 /**
  * An EC2 worker's identity is its own instance id, read from IMDSv2.
@@ -123,6 +125,25 @@ export const createWorker = ({
   let jobsClaimed = 0;
   let heartbeatTimer = null;
 
+  /**
+   * Block until the detached stage job finishes.
+   *
+   * `busy.count` is 1 for THIS worker's own enter() plus 1 for every background job
+   * the handler started, so the stage is done when it falls back to 1. A worker whose
+   * handler does not use the tracker (or an older container) reports no count at
+   * all — then there is nothing to wait for and this returns immediately, which
+   * keeps a short synchronous command as fast as it was.
+   *
+   * The registry heartbeat runs on its own timer throughout, so the lease stays
+   * renewed for as long as this waits.
+   */
+  const drainBusy = async () => {
+    if (typeof busy?.count !== 'number') return;
+    while (running && busy.count > 1) {
+      await new Promise((resolve) => setTimeout(resolve, BUSY_POLL_MS));
+    }
+  };
+
   const runJob = async (job, { entryId = null } = {}) => {
     const worker = await registry.getWorker(workerId);
     // markBusy BEFORE asking for a grant: the scheduler will only mint one for a
@@ -190,6 +211,21 @@ export const createWorker = ({
       // failed stage into a dead worker.
       return null;
     } finally {
+      // WAIT for the detached stage before letting go of anything.
+      //
+      // `run-stage-start` accepts a stage and returns `{ accepted: true }` in
+      // milliseconds; the stage itself runs on as a background job and holds `busy`
+      // for its real lifetime — that is the tracker AgentCore's /ping reads to say
+      // HealthyBusy. Marking the registry row IDLE when the ACCEPT returns therefore
+      // claims the worker is free while a build is running on it, and the
+      // reconciler's idle reap then terminates the instance out from under the
+      // stage: TerminateInstances → systemd stops the unit → SIGTERM to the CLI →
+      // `cli_nonzero_exit: 143`, five minutes into a stage that had already produced
+      // three artifacts. That is precisely how reverse-engineering died.
+      //
+      // Harmless before an idle reap existed, lethal after — so the wait belongs
+      // here, next to the state it protects.
+      await drainBusy();
       busy?.leave();
       // ACK after the job is finished, not when it is claimed: an unacked entry is
       // exactly what lets the reconciler notice a worker that died mid-stage.
