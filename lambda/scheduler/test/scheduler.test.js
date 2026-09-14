@@ -480,6 +480,12 @@ describe.skipIf(!host)('scheduler', () => {
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
       await registry.markIdle(await registry.getWorker(workerId));
+      // `markIdle` stamps `idleSinceMs` from the REGISTRY's clock, which is real
+      // time here, while the sweep judges against the scheduler's injected one. Left
+      // alone the two timelines are ~1.8e12 ms apart and `idleForMs` comes out
+      // hugely negative, so the reap never fires and the test passes for the wrong
+      // reason. Restate the stamp on the scheduler's timeline.
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
 
       now += 10 * 60 * 1000;
       // NO environmentIds — exactly the event the rule delivers.
