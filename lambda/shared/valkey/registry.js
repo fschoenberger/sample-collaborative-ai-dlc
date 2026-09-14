@@ -25,6 +25,7 @@ import {
   environmentIdleKey,
   environmentQueueKey,
   environmentWorkersKey,
+  environmentsKey,
   jobMetaKey,
   workerMetaKey,
   workerStreamKey,
@@ -145,8 +146,23 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     await pipeline.exec();
     // Different tag ({e:…}), so this is a separate round trip by necessity.
     await client.sadd(environmentWorkersKey(worker.environmentId), worker.workerId);
+    // And remember the ENVIRONMENT, not just the worker. The reconciler runs off a
+    // fixed EventBridge rule that cannot name environments an operator created at
+    // runtime, so without this index its sweep had nothing to iterate.
+    await client.sadd(environmentsKey(), worker.environmentId);
     return decodeWorker(flat);
   };
+
+  /**
+   * Every environment the scheduler has ever placed a worker in.
+   *
+   * Deliberately NOT pruned when an environment's last worker goes away: the set is
+   * tiny (one short string per environment, ever), and an environment with no
+   * workers costs the sweep one empty SMEMBERS. Pruning would risk dropping an
+   * environment whose row expired while an instance of it is still running — which
+   * is precisely the case the sweep exists to catch.
+   */
+  const listEnvironments = async () => (await client.smembers(environmentsKey())) ?? [];
 
   const getWorker = async (workerId) => decodeWorker(await client.hgetall(workerMetaKey(workerId)));
 
@@ -406,6 +422,7 @@ export const createRegistry = ({ client, clock = nowMs }) => {
     putWorker,
     getWorker,
     listWorkers,
+    listEnvironments,
     setWorkerState,
     markIdle,
     markBusy,

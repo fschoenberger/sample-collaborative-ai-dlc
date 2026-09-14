@@ -59,6 +59,12 @@ export VCPKG_ROOT=/opt/vcpkg
 export PATH="${VCPKG_ROOT}:${PATH}"
 PROFILE
 chmod 0644 /etc/profile.d/aidlc-toolchain.sh
+# A symlink as well as the profile script and the launcher's PATH, because the
+# three reach different processes: profile.d covers a login shell, the launcher
+# covers the runner and everything it spawns, and this covers anything that got
+# neither — a script with its own PATH, or a future unit that does not use the
+# launcher. `vcpkg` must resolve for a stage told to use vcpkg and nothing else.
+ln -sf /opt/vcpkg/vcpkg /usr/local/bin/vcpkg
 
 # ── Node ────────────────────────────────────────────────────────────────────
 # Read from the Dockerfile so a worker and the container run the same runtime.
@@ -124,7 +130,16 @@ install -d "${RUNNER_ROOT}/bin"
 cat > "${RUNNER_ROOT}/bin/aidlc-runner" <<LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
-export PATH="${RUNNER_ROOT}/node/bin:/usr/local/bin:\${PATH}"
+# /opt/vcpkg AND /opt/bun/bin on PATH, not just VCPKG_ROOT.
+#
+# systemd hands a service its own minimal PATH — no /etc/profile, so
+# /etc/profile.d/aidlc-toolchain.sh never runs and none of the toolchain's own
+# directories are on it. Every process the agent spawns inherits THIS PATH, so
+# with only VCPKG_ROOT exported a stage could open the vcpkg tree but could not
+# run \`vcpkg install\`: the binary lives at /opt/vcpkg/vcpkg and nothing linked
+# it. An interactive SSM shell DID have it (that is the profile.d script), which
+# is exactly why this looked fine when checked by hand.
+export PATH="${RUNNER_ROOT}/node/bin:/opt/vcpkg:/opt/bun/bin:/usr/local/bin:\${PATH}"
 export VCPKG_ROOT=/opt/vcpkg
 export V2_WORKSPACE_DIR="\${V2_WORKSPACE_DIR:-/mnt/workspace}"
 mkdir -p "\${V2_WORKSPACE_DIR}"

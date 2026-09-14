@@ -366,7 +366,48 @@ export const createScheduler = ({
    * terminate the instance, so the instance that outlives its runner is found by
    * asking EC2, not by reading Valkey.
    */
-  const reconcile = async ({ environmentIds = [] } = {}) => {
+  // Every instance this scheduler owns that is currently alive. One call, shared by
+  // the sweep and the orphan reap so they cannot disagree about what exists.
+  const runningManagedInstances = async () => {
+    const response = await describeInstances({
+      Filters: [
+        { Name: `tag:${MANAGED_TAG}`, Values: ['worker'] },
+        { Name: 'instance-state-name', Values: ['pending', 'running'] },
+      ],
+    });
+    return (response.Reservations ?? []).flatMap((r) => r.Instances ?? []);
+  };
+
+  /**
+   * Which environments the sweep covers.
+   *
+   * DISCOVERED, not supplied. The EventBridge rule that drives this on a schedule
+   * carries a static `{"action":"reconcile"}` — a rule input cannot enumerate
+   * environments an operator creates through the API — so an `environmentIds`
+   * parameter defaulting to `[]` meant the scheduled sweep iterated nothing and
+   * silently did no work at all. Verified live: the same call with an explicit
+   * environment id reaped a finished worker that four scheduled runs had walked
+   * straight past.
+   *
+   * Two sources, unioned, because each sees a case the other misses:
+   *   - the registry's environment set: environments with worker rows, including
+   *     ones whose instances are already gone;
+   *   - the `aidlc:environmentId` tag on running instances: environments whose
+   *     rows have EXPIRED, which is exactly the leak the sweep is for.
+   * An explicit argument still wins, so ops tooling can scope a single sweep.
+   */
+  const environmentsToSweep = async (requested) => {
+    if (requested?.length) return { ids: [...new Set(requested)], complete: true };
+    const ids = new Set(await registry.listEnvironments());
+    for (const instance of await runningManagedInstances()) {
+      const tagged = instance.Tags?.find((t) => t.Key === 'aidlc:environmentId')?.Value;
+      if (tagged) ids.add(tagged);
+    }
+    return { ids: [...ids], complete: true };
+  };
+
+  const reconcile = async ({ environmentIds: requestedEnvironmentIds } = {}) => {
+    const { ids: environmentIds } = await environmentsToSweep(requestedEnvironmentIds);
     const now = clock();
     const abandoned = [];
     const timedOut = [];
@@ -422,7 +463,7 @@ export const createScheduler = ({
     }
 
     const orphans = await reapOrphans({ environmentIds });
-    return { ok: true, abandoned, timedOut, expired, idle, orphans };
+    return { ok: true, environmentIds, abandoned, timedOut, expired, idle, orphans };
   };
 
   // EC2 is the authority on which instances exist. Anything running with our tag
@@ -430,31 +471,47 @@ export const createScheduler = ({
   // a pure cost leak — so it is terminated. Deliberately conservative: only
   // instances old enough that a slow registration cannot explain the absence.
   const reapOrphans = async ({ environmentIds, minAgeMs = 15 * 60 * 1000 } = {}) => {
+    const instances = await runningManagedInstances();
+    // An instance whose environment was not inspected is NOT an orphan.
+    //
+    // `known` is built by listing each swept environment's workers, so an empty
+    // environment list yields an empty `known` and makes every live instance look
+    // unowned. That is a terminate-everything bug waiting on a caller who passes
+    // the wrong scope — and it is only latent today because the scheduled sweep
+    // passed no environments at all, so the two bugs cancelled out. Judge an
+    // instance solely against the environments actually examined.
+    const swept = new Set(environmentIds);
     const known = new Set();
     for (const environmentId of environmentIds) {
       for (const worker of await registry.listWorkers(environmentId)) {
         if (worker.instanceId) known.add(worker.instanceId);
       }
     }
-    const response = await describeInstances({
-      Filters: [
-        { Name: `tag:${MANAGED_TAG}`, Values: ['worker'] },
-        { Name: 'instance-state-name', Values: ['pending', 'running'] },
-      ],
-    });
     const orphans = [];
+    const skipped = [];
     const now = clock();
-    for (const reservation of response.Reservations ?? []) {
-      for (const instance of reservation.Instances ?? []) {
-        if (known.has(instance.InstanceId)) continue;
-        const launched = instance.LaunchTime ? new Date(instance.LaunchTime).getTime() : now;
-        if (now - launched < minAgeMs) continue;
-        const kind = 'EC2';
-        await provisionerFor(kind, provisioners).terminate({
-          worker: { instanceId: instance.InstanceId, kind },
-        });
-        orphans.push(instance.InstanceId);
+    for (const instance of instances) {
+      if (known.has(instance.InstanceId)) continue;
+      const tagged = instance.Tags?.find((t) => t.Key === 'aidlc:environmentId')?.Value ?? null;
+      if (!tagged || !swept.has(tagged)) {
+        skipped.push(instance.InstanceId);
+        continue;
       }
+      const launched = instance.LaunchTime ? new Date(instance.LaunchTime).getTime() : now;
+      if (now - launched < minAgeMs) continue;
+      const kind = 'EC2';
+      await provisionerFor(kind, provisioners).terminate({
+        worker: { instanceId: instance.InstanceId, kind },
+      });
+      orphans.push(instance.InstanceId);
+    }
+    if (skipped.length > 0) {
+      // Loud, because this is the shape of a real leak: a tagged instance nobody
+      // claims and this sweep declined to judge.
+      console.error('[scheduler] managed instances outside the swept environments', {
+        instanceIds: skipped,
+        swept: [...swept],
+      });
     }
     return orphans;
   };
@@ -469,6 +526,7 @@ export const createScheduler = ({
     issueGrant,
     reconcile,
     reapOrphans,
+    environmentsToSweep,
   };
 };
 

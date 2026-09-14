@@ -410,7 +410,15 @@ describe.skipIf(!host)('scheduler', () => {
         clock: () => 10_000_000,
         describeInstances: async () => ({
           Reservations: [
-            { Instances: [{ InstanceId: 'i-orphan', LaunchTime: new Date(1_000_000) }] },
+            {
+              Instances: [
+                {
+                  InstanceId: 'i-orphan',
+                  LaunchTime: new Date(1_000_000),
+                  Tags: [{ Key: 'aidlc:environmentId', Value: environmentId }],
+                },
+              ],
+            },
           ],
         }),
       });
@@ -421,6 +429,95 @@ describe.skipIf(!host)('scheduler', () => {
       expect(provisioners.ec2Stub.terminate).toHaveBeenCalledWith(
         expect.objectContaining({ worker: expect.objectContaining({ instanceId: 'i-orphan' }) }),
       );
+    });
+
+    it('never terminates an instance belonging to an environment it did not sweep', async () => {
+      // The terminate-everything bug this closes: `known` is built by listing the
+      // SWEPT environments' workers, so a caller scoping the sweep narrowly (or, as
+      // the EventBridge rule did, to nothing at all) made every live instance in
+      // every other environment look unowned. An instance is only judged against
+      // the environments actually examined.
+      const environmentId = nextEnv();
+      const otherEnvironmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, {
+        clock: () => 10_000_000,
+        describeInstances: async () => ({
+          Reservations: [
+            {
+              Instances: [
+                {
+                  InstanceId: 'i-elsewhere',
+                  LaunchTime: new Date(1_000_000),
+                  Tags: [{ Key: 'aidlc:environmentId', Value: otherEnvironmentId }],
+                },
+                { InstanceId: 'i-untagged', LaunchTime: new Date(1_000_000) },
+              ],
+            },
+          ],
+        }),
+      });
+
+      const result = await scheduler.reconcile({ environmentIds: [environmentId] });
+
+      expect(result.orphans).toEqual([]);
+      expect(provisioners.ec2Stub.terminate).not.toHaveBeenCalled();
+    });
+
+    it('discovers the environments to sweep when the caller names none', async () => {
+      // The bug the schedule actually had: EventBridge sends a static
+      // `{"action":"reconcile"}`, `environmentIds` defaulted to `[]`, and the whole
+      // per-environment sweep — abandoned leases, bootstrap timeout, idle reap,
+      // lifetime cap — iterated nothing. It ran every five minutes and never once
+      // reaped anything, which is why finished instances kept billing until an
+      // operator noticed them.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        describeInstances: noInstances,
+        clock: () => now,
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.markIdle(await registry.getWorker(workerId));
+
+      now += 10 * 60 * 1000;
+      // NO environmentIds — exactly the event the rule delivers.
+      const result = await scheduler.reconcile({});
+
+      expect(result.environmentIds).toContain(environmentId);
+      expect(result.idle).toContain(workerId);
+    });
+
+    it('discovers an environment from a running instance whose worker row has expired', async () => {
+      // The lease outlives nothing: a worker row expires after WORKER_LEASE_SECONDS,
+      // so an instance whose runner died is invisible to the registry. Its
+      // `aidlc:environmentId` tag is then the ONLY way the sweep learns the
+      // environment exists — and without that it would never look, which is how a
+      // dead-runner instance ran until its lifetime cap (or forever, when unset).
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, {
+        clock: () => 10_000_000,
+        describeInstances: async () => ({
+          Reservations: [
+            {
+              Instances: [
+                {
+                  InstanceId: 'i-rowless',
+                  LaunchTime: new Date(1_000_000),
+                  Tags: [{ Key: 'aidlc:environmentId', Value: environmentId }],
+                },
+              ],
+            },
+          ],
+        }),
+      });
+
+      const result = await scheduler.reconcile({});
+
+      expect(result.environmentIds).toContain(environmentId);
+      expect(result.orphans).toEqual(['i-rowless']);
     });
 
     it('spares a young instance that may simply not have registered yet', async () => {

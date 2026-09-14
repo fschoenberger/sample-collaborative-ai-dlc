@@ -171,6 +171,11 @@ export const checkoutRepo = async ({
         repository: repo,
         requiredAccess: 'read',
       },
+      // stdio INHERITED, deliberately: the worker's stdout/stderr is teed to
+      // /var/log/aidlc/runner.log and shipped to CloudWatch, so git's own account
+      // of a failure lands there verbatim. Capturing it here would take it OUT of
+      // that stream in exchange for a string this code would then have to guess
+      // the meaning of.
       ({ env }) => runner('git', ['clone', cleanUrl, targetDir], { env }),
     );
   } catch (error) {
@@ -180,7 +185,10 @@ export const checkoutRepo = async ({
   if (!cloned) {
     console.error('[workspace] clone failed', {
       provider: gitProvider,
+      repo,
+      targetDir,
       reason: clone.error || 'clone_failed',
+      code: clone.code ?? null,
     });
     // Empty remote repositories clone successfully. Any clone failure is a
     // real authentication/authorization/repository error; remove partial git
@@ -192,6 +200,7 @@ export const checkoutRepo = async ({
       cloned: false,
       branchOk: false,
       error: clone.error || 'clone_failed',
+      code: clone.code ?? null,
     };
   }
   // Defense in depth: origin was cloned from this same clean URL, but re-stamp
