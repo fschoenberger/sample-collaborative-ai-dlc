@@ -390,6 +390,17 @@ export const createScheduler = ({
    * terminate the instance, so the instance that outlives its runner is found by
    * asking EC2, not by reading Valkey.
    */
+  // An instance's own tags, used only to recover an execution id the registry row lost.
+  // THROWS on a read failure rather than answering null, so the caller cannot mistake
+  // "could not look" for "no execution" — the first must spare the worker, the second
+  // may reap it, and collapsing them is how a guard fails open.
+  const executionIdFromTags = async (worker) => {
+    if (!worker?.instanceId) return null;
+    const response = await describeInstances({ InstanceIds: [worker.instanceId] });
+    const instance = (response.Reservations ?? []).flatMap((r) => r.Instances ?? [])[0];
+    return instance?.Tags?.find((t) => t.Key === 'aidlc:executionId')?.Value || null;
+  };
+
   /**
    * Is this worker's execution still running the stage it was placed for?
    *
@@ -399,14 +410,23 @@ export const createScheduler = ({
    * a human's answered gates.
    */
   const executionHasRunningStage = async (worker) => {
-    if (!worker?.executionId) return false;
+    // The row's executionId may be missing, and that is not the worker's fault: any
+    // image built before `putWorker` stopped writing `executionId: ''` blanks it when
+    // the runner self-registers. Recover it from the instance's own
+    // `aidlc:executionId` tag, which CreateFleet set and nothing overwrites — an
+    // execution snapshot is frozen per run, so an in-flight run can never receive the
+    // registry fix, and without this fallback the guard is inert for exactly the runs
+    // that need it.
+    let executionId = worker?.executionId ?? null;
     let execution;
     try {
-      execution = await readExecution(worker.executionId);
+      executionId = executionId ?? (await executionIdFromTags(worker));
+      if (!executionId) return false;
+      execution = await readExecution(executionId);
     } catch (error) {
       console.error('[scheduler] could not read execution for a reap candidate', {
         workerId: worker.workerId,
-        executionId: worker.executionId,
+        executionId,
         error: error?.message,
       });
       return true;

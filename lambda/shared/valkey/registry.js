@@ -73,8 +73,6 @@ const encodeWorker = (worker) => {
     environmentId: worker.environmentId,
     revisionId: worker.revisionId ?? '',
     state: worker.state,
-    executionId: worker.executionId ?? '',
-    stageInstanceId: worker.stageInstanceId ?? '',
     currentJobId: worker.currentJobId ?? '',
     draining: worker.draining ? '1' : '',
     // Held across a human gate under parkPolicy `hold`: idle deliberately, so the
@@ -85,6 +83,18 @@ const encodeWorker = (worker) => {
     maxLifetimeSeconds: String(worker.maxLifetimeSeconds ?? 0),
     bootstrapTimeoutSeconds: String(worker.bootstrapTimeoutSeconds ?? 0),
   };
+  // CONDITIONAL, like instanceId below — never written as ''. HSET only touches the
+  // fields it is given, so omitting these PRESERVES them, while `?? ''` erased them.
+  //
+  // That erasure was live for the whole feature. The scheduler stamps executionId and
+  // stageInstanceId when it provisions; the runner then calls putWorker again from its
+  // own start() without either, about forty seconds later, blanking both. Everything
+  // keyed on worker identity therefore failed silently after that moment:
+  // `releaseExecution` filters by executionId and so released nothing on cancel or
+  // rewind, and the reap guard could not tell which execution a worker belonged to and
+  // fell through to terminating it mid-stage.
+  if (worker.executionId) flat.executionId = worker.executionId;
+  if (worker.stageInstanceId) flat.stageInstanceId = worker.stageInstanceId;
   if (worker.instanceId) flat.instanceId = worker.instanceId;
   if (worker.sessionId) flat.sessionId = worker.sessionId;
   if (worker.fleetId) flat.fleetId = worker.fleetId;

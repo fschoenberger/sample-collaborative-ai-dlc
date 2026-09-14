@@ -618,6 +618,115 @@ describe.skipIf(!host)('scheduler', () => {
       );
     });
 
+    it('recovers a lost executionId from the instance tag before reaping', async () => {
+      // Any worker image predating the registry fix blanks executionId on
+      // self-registration, and an in-flight run can never receive that fix because its
+      // environment snapshot is frozen. Without the tag fallback the guard is inert for
+      // exactly the runs that need it — which is how a stage doing real cmake work got
+      // terminated 3m26s in.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      const scheduler = schedulerWith(provisioners, {
+        clock: () => now,
+        describeInstances: async () => ({
+          Reservations: [
+            {
+              Instances: [
+                {
+                  InstanceId: 'i--1-s-1-1',
+                  LaunchTime: new Date(now),
+                  Tags: [{ Key: 'aidlc:executionId', Value: 'x-1' }],
+                },
+              ],
+            },
+          ],
+        }),
+        readExecution: async (executionId) => {
+          expect(executionId).toBe('x-1');
+          return {
+            status: 'RUNNING',
+            process: { stages: [{ stageInstanceId: 's-1', state: 'RUNNING' }] },
+          };
+        },
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      // Exactly what an older runner does on start(): re-register with no identity.
+      await registry.putWorker({
+        workerId,
+        kind: 'EC2',
+        environmentId,
+        state: 'IDLE',
+        instanceId: workerId,
+        createdAtMs: now,
+      });
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+
+      expect((await scheduler.reconcile({ environmentIds: [environmentId] })).idle).not.toContain(
+        workerId,
+      );
+    });
+
+    it('spares a reap candidate whose instance tags cannot be read', async () => {
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      let now = 5_000_000;
+      let firstCall = true;
+      const scheduler = schedulerWith(provisioners, {
+        clock: () => now,
+        // The sweep's own listing succeeds; the per-candidate tag lookup fails.
+        describeInstances: async () => {
+          if (firstCall) {
+            firstCall = false;
+            return { Reservations: [] };
+          }
+          throw new Error('RequestLimitExceeded');
+        },
+        readExecution: async () => ({ status: 'SUCCEEDED', process: { stages: [] } }),
+      });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+      await registry.putWorker({
+        workerId,
+        kind: 'EC2',
+        environmentId,
+        state: 'IDLE',
+        instanceId: workerId,
+        createdAtMs: now,
+      });
+      await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
+
+      now += 10 * 60 * 1000;
+
+      expect((await scheduler.reconcile({ environmentIds: [environmentId] })).idle).not.toContain(
+        workerId,
+      );
+    });
+
+    it('keeps the executionId the scheduler stamped when a runner re-registers', async () => {
+      // The erasure itself: `putWorker` wrote `executionId: ''`, so a runner's own
+      // start() blanked the identity 40 seconds in. Everything keyed on it then failed
+      // silently — including releaseExecution, which released nothing on cancel.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners, { describeInstances: noInstances });
+      const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
+
+      await registry.putWorker({
+        workerId,
+        kind: 'EC2',
+        environmentId,
+        state: 'IDLE',
+        instanceId: workerId,
+        createdAtMs: Date.now(),
+      });
+
+      const row = await registry.getWorker(workerId);
+      expect(row.executionId).toBe('x-1');
+      expect(row.stageInstanceId).toBe('s-1');
+    });
+
     it('reaps an idle worker once its execution has finished', async () => {
       const environmentId = nextEnv();
       const provisioners = stubProvisioners();
