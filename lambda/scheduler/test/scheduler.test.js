@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import Valkey from 'iovalkey';
 import { createRegistry } from '../../shared/valkey/registry.js';
-import { CONSUMER_GROUP, environmentQueueKey } from '../../shared/valkey/keys.js';
+import { CONSUMER_GROUP, environmentQueueKey, workerMetaKey } from '../../shared/valkey/keys.js';
 import { createScheduler } from '../index.js';
 
 // The registry here is the REAL one against the REAL Valkey container. Only the
@@ -651,15 +651,10 @@ describe.skipIf(!host)('scheduler', () => {
         },
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
-      // Exactly what an older runner does on start(): re-register with no identity.
-      await registry.putWorker({
-        workerId,
-        kind: 'EC2',
-        environmentId,
-        state: 'IDLE',
-        instanceId: workerId,
-        createdAtMs: now,
-      });
+      // Reproduce an OLDER image, which wrote `executionId: ''` and blanked it. Note
+      // putWorker can no longer be used for this: omitting the field now PRESERVES it,
+      // which is the fix — so the erasure has to be written directly.
+      await client.hset(workerMetaKey(workerId), { executionId: '', stageInstanceId: '' });
       await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
 
       now += 10 * 60 * 1000;
@@ -687,14 +682,7 @@ describe.skipIf(!host)('scheduler', () => {
         readExecution: async () => ({ status: 'SUCCEEDED', process: { stages: [] } }),
       });
       const { workerId } = await scheduler.enqueueStage(stageRequest(ec2Target(environmentId)));
-      await registry.putWorker({
-        workerId,
-        kind: 'EC2',
-        environmentId,
-        state: 'IDLE',
-        instanceId: workerId,
-        createdAtMs: now,
-      });
+      await client.hset(workerMetaKey(workerId), { executionId: '', stageInstanceId: '' });
       await registry.setWorkerState(workerId, 'IDLE', { currentJobId: '', idleSinceMs: now });
 
       now += 10 * 60 * 1000;
