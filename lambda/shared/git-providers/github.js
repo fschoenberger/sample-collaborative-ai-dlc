@@ -85,17 +85,7 @@ const oauth = {
       scope: data.scope,
     };
   },
-  // NOT a guarantee — an OAuth App can be configured to EXPIRE user tokens (8 hours,
-  // with a refresh token returned alongside). This deployment had that enabled, and
-  // because nothing here captured `refresh_token`/`expires_in`, every run died ~8
-  // hours after the connect with `workspace_restore_failed: could not re-clone` and
-  // no mention of auth anywhere. Recovery was a manual re-authorize.
-  //
-  // Currently relying on expiry being OFF for the GitHub app, which makes the
-  // passthrough below correct. Turning it back on REQUIRES capturing the refresh
-  // token here, teaching ensureFreshGitToken that github is refreshable, and adding
-  // github to the 401-recovery path in source-control-credentials.js — the same three
-  // places GitLab and Bitbucket already occupy.
+  // No refreshToken — GitHub OAuth App tokens do not expire.
 };
 
 // ---------------------------------------------------------------------------
