@@ -41,6 +41,7 @@ const INSTANCE_FAMILY_PATTERN = /^[a-z][a-z0-9-]*$/;
 const ACCOUNT_PATTERN = /^\d{12}$/;
 const SECURITY_GROUP_PATTERN = /^sg-[0-9a-f]{8}([0-9a-f]{9})?$/;
 const POLICY_ARN_PATTERN = /^arn:[a-z0-9-]+:iam::(aws|\d{12}):policy\/.+$/;
+const ROLE_ARN_PATTERN = /^arn:[a-z0-9-]+:iam::\d{12}:role\/.+$/;
 const AZ_PATTERN = /^[a-z]{2}(-[a-z]+)+-\d[a-z]$/;
 const ACCELERATOR_MANUFACTURER_PATTERN = /^[a-z0-9-]+$/;
 const ACCELERATOR_TYPE_PATTERN = /^[a-z]+$/;
@@ -124,6 +125,7 @@ export interface Ec2LaunchSpec {
   associatePublicIp: boolean;
   securityGroupIds: string[];
   additionalPolicyArns: string[];
+  instanceRoleArn: string | null;
   workspacePath: string;
   parkPolicy: Ec2ParkPolicy;
   strategyId: Ec2SchedulerStrategy;
@@ -159,6 +161,7 @@ export interface Ec2LaunchSpecInput {
   workspaceOnInstanceStore?: boolean;
   securityGroupIds?: string[];
   additionalPolicyArns?: string[];
+  instanceRoleArn?: string | null;
   workspacePath?: string;
   parkPolicy?: string;
   strategyId?: string;
@@ -367,6 +370,11 @@ export const validateEc2LaunchSpecInput = (input: Ec2LaunchSpecInput): FieldErro
     label: 'IAM policy ARN',
     errors,
   });
+  if (input.instanceRoleArn != null && String(input.instanceRoleArn).trim() !== '') {
+    if (!ROLE_ARN_PATTERN.test(String(input.instanceRoleArn).trim())) {
+      errors.push(err('instanceRoleArn', 'must be an IAM role ARN in this account'));
+    }
+  }
 
   const volumeType = (input.rootVolume?.type ??
     EC2_LAUNCH_SPEC_DEFAULTS.rootVolume.type) as Ec2VolumeType;

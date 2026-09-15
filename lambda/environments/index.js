@@ -3,6 +3,14 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { S3Client } from '@aws-sdk/client-s3';
 import { CodeBuildClient, StartBuildCommand } from '@aws-sdk/client-codebuild';
 import { EC2Client, DescribeImagesCommand } from '@aws-sdk/client-ec2';
+import {
+  IAMClient,
+  SimulatePrincipalPolicyCommand,
+  GetInstanceProfileCommand,
+  CreateInstanceProfileCommand,
+  AddRoleToInstanceProfileCommand,
+  RemoveRoleFromInstanceProfileCommand,
+} from '@aws-sdk/client-iam';
 import { buildResponse } from '../shared/response.js';
 import { isPlatformAdmin, requirePlatformAdmin } from '../shared/authz.js';
 import {
@@ -35,6 +43,106 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
 const codebuild = new CodeBuildClient({});
 const ec2 = new EC2Client({});
+const iam = new IAMClient({});
+
+// The permissions a worker MUST retain to be a worker at all, regardless of what a
+// custom instance role adds. These are the SSM-agent connectivity actions
+// AmazonSSMManagedInstanceCore grants: without them the instance never registers
+// with SSM, so the scheduler cannot Run-Command it, an operator cannot get a shell
+// on a stuck build, and the runner's whole reach-back path is dead — a failure that
+// would surface as an opaque bootstrap timeout, not a permissions error. A
+// bring-your-own instance role is validated against THIS floor before its revision
+// may ready, so an operator who scopes a role too tightly is told at publish time
+// rather than discovering it when every stage times out.
+const WORKER_BASELINE_ACTIONS = [
+  'ssm:UpdateInstanceInformation',
+  'ssmmessages:CreateControlChannel',
+  'ssmmessages:CreateDataChannel',
+  'ssmmessages:OpenControlChannel',
+  'ssmmessages:OpenDataChannel',
+  'ec2messages:GetMessages',
+  'ec2messages:AcknowledgeMessage',
+  'ec2messages:SendReply',
+];
+
+/**
+ * Prove a custom instance role still grants the worker baseline.
+ *
+ * Uses IAM policy simulation rather than reading and diffing policy documents,
+ * because "does this role effectively allow X" is exactly what the simulator
+ * answers and a hand-rolled diff would miss deny statements, boundaries and SCP
+ * interactions. Any action that does not evaluate to `allowed` is returned; an
+ * empty list means the role covers the floor.
+ */
+const missingBaselineActions = async ({ iam: iamClient, roleArn }) => {
+  const res = await iamClient.send(
+    new SimulatePrincipalPolicyCommand({
+      PolicySourceArn: roleArn,
+      ActionNames: WORKER_BASELINE_ACTIONS,
+    }),
+  );
+  return (res.EvaluationResults ?? [])
+    .filter((r) => r.EvalDecision !== 'allowed')
+    .map((r) => r.EvalActionName);
+};
+
+const roleNameFromArn = (roleArn) => String(roleArn).split('/').pop();
+
+/**
+ * Resolve the instance profile a per-env role's workers launch with.
+ *
+ * A launch template needs an instance PROFILE arn, not a role arn, and a role is
+ * not usable as a profile until one wraps it — so the platform owns a profile per
+ * environment (`aidlc-worker-<envId>`) and keeps exactly the env's chosen role in
+ * it. Idempotent: reused if already correct, re-pointed if the env's role changed,
+ * created if absent. Returns the profile ARN.
+ */
+const ensureInstanceProfileForRole = async ({ iam: iamClient, environmentId, roleArn }) => {
+  const profileName = `aidlc-worker-${environmentId}`.slice(0, 128);
+  const roleName = roleNameFromArn(roleArn);
+  let profile = null;
+  try {
+    const got = await iamClient.send(
+      new GetInstanceProfileCommand({ InstanceProfileName: profileName }),
+    );
+    profile = got.InstanceProfile;
+  } catch (error) {
+    if (error?.name !== 'NoSuchEntityException') throw error;
+  }
+  if (!profile) {
+    const created = await iamClient.send(
+      new CreateInstanceProfileCommand({ InstanceProfileName: profileName }),
+    );
+    profile = created.InstanceProfile;
+    await iamClient.send(
+      new AddRoleToInstanceProfileCommand({
+        InstanceProfileName: profileName,
+        RoleName: roleName,
+      }),
+    );
+    return profile.Arn;
+  }
+  // An instance profile holds at most one role. Re-point it if the environment now
+  // names a different role than the profile currently carries.
+  const current = profile.Roles?.[0]?.RoleName ?? null;
+  if (current !== roleName) {
+    if (current) {
+      await iamClient.send(
+        new RemoveRoleFromInstanceProfileCommand({
+          InstanceProfileName: profileName,
+          RoleName: current,
+        }),
+      );
+    }
+    await iamClient.send(
+      new AddRoleToInstanceProfileCommand({
+        InstanceProfileName: profileName,
+        RoleName: roleName,
+      }),
+    );
+  }
+  return profile.Arn;
+};
 const defaultStore = createEnvironmentStore({ ddb });
 const defaultToolStore = createToolStore({ ddb });
 
@@ -211,12 +319,50 @@ const readyEc2Revision = async ({ store, environment, revision, spec, deps }) =>
     });
   }
 
+  // A per-environment instance role: prove it covers the worker baseline, then wrap
+  // it in this environment's instance profile. Done BEFORE the launch template so a
+  // role too tight to run a worker fails the revision here — at publish time, with a
+  // named reason — instead of at first placement as an unexplained bootstrap
+  // timeout. When no role is declared the shared default profile is used unchanged.
+  let instanceProfileArn = platform.instanceProfileArn;
+  if (spec.instanceRoleArn) {
+    let missing;
+    try {
+      missing = await missingBaselineActions({ iam: deps.iam, roleArn: spec.instanceRoleArn });
+    } catch (error) {
+      return store.updateRevision(environment.environmentId, revision.revisionId, {
+        status: 'FAILED',
+        failure: {
+          code: 'INSTANCE_ROLE_UNVERIFIABLE',
+          errors: [`Could not simulate ${spec.instanceRoleArn}: ${error?.name ?? error?.message}`],
+        },
+      });
+    }
+    if (missing.length > 0) {
+      return store.updateRevision(environment.environmentId, revision.revisionId, {
+        status: 'FAILED',
+        failure: {
+          code: 'INSTANCE_ROLE_MISSING_BASELINE',
+          errors: [
+            `Instance role ${spec.instanceRoleArn} does not grant the worker baseline: ${missing.join(', ')}`,
+          ],
+        },
+      });
+    }
+    instanceProfileArn = await ensureInstanceProfileForRole({
+      iam: deps.iam,
+      environmentId: environment.environmentId,
+      roleArn: spec.instanceRoleArn,
+    });
+  }
+
   const launch = await createLaunchTemplateForRevision({
     ec2: deps.ec2,
     spec,
     environmentId: environment.environmentId,
     revisionId: revision.revisionId,
     platform,
+    instanceProfileArn,
   });
   return store.updateRevision(environment.environmentId, revision.revisionId, {
     status: 'READY',
@@ -432,8 +578,15 @@ export const createHandler = ({
   s3Client = s3,
   codebuildClient = codebuild,
   ec2Client = ec2,
+  iamClient = iam,
 } = {}) => {
-  const deps = { s3: s3Client, codebuild: codebuildClient, ec2: ec2Client, DescribeImagesCommand };
+  const deps = {
+    s3: s3Client,
+    codebuild: codebuildClient,
+    ec2: ec2Client,
+    iam: iamClient,
+    DescribeImagesCommand,
+  };
   const initialize = createRetryableInitializer(() => ensureSeeded(store));
   return async (event) => {
     const response = buildResponse(event);

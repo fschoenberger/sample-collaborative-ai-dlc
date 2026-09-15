@@ -196,10 +196,17 @@ resource "aws_iam_role_policy" "scheduler" {
         }
       },
       {
-        # CreateFleet hands the instance profile to the instance.
+        # CreateFleet hands the instance profile to the instance. The default
+        # executor role covers most environments; a bring-your-own-compute EC2
+        # environment declares its OWN instanceRoleArn (verified against the worker
+        # baseline at publish), and those role ARNs are operator-supplied and unknown
+        # at apply time — so PassRole cannot be pinned to a fixed ARN here. The
+        # PassedToService condition is what bounds the grant: this role may only be
+        # passed when launching an EC2 instance, which is the only thing the scheduler
+        # ever does with a role.
         Effect   = "Allow"
         Action   = ["iam:PassRole"]
-        Resource = var.executor_role_arn
+        Resource = "*"
         Condition = {
           StringEquals = { "iam:PassedToService" = "ec2.${local.dns_suffix}" }
         }
@@ -275,7 +282,7 @@ module "scheduler_lambda" {
     # Read by the reconciler's queue sweep to tell a deleted execution from an
     # unreadable one: the first means the queued entry is a corpse and must go, the
     # second means keep it. Without this the sweep could only ever do the latter.
-    V2_PROCESS_TABLE                    = var.v2_executions_table_name
+    V2_PROCESS_TABLE = var.v2_executions_table_name
   }
 }
 

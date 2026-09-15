@@ -315,6 +315,26 @@ resource "aws_iam_role_policy" "control_ec2" {
           StringEquals = { "iam:PassedToService" = "ec2.${local.dns_suffix}" }
         }
       },
+      {
+        # A per-environment instance role (launch spec instanceRoleArn) is verified
+        # against the worker baseline before its revision may ready, and wrapped in a
+        # platform-owned instance profile the launch template then embeds. Simulation
+        # is read-only; the instance-profile actions are scoped to the aidlc-worker-*
+        # profiles this module names.
+        Effect   = "Allow"
+        Action   = ["iam:SimulatePrincipalPolicy"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "iam:GetInstanceProfile",
+          "iam:CreateInstanceProfile",
+          "iam:AddRoleToInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+        ]
+        Resource = "arn:${local.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/aidlc-worker-*"
+      },
     ]
   })
 }

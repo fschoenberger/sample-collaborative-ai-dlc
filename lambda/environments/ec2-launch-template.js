@@ -222,7 +222,18 @@ echo "[aidlc] worker started"
  * profile. An operator can add security groups and extra volumes; they cannot
  * weaken these.
  */
-export const launchTemplateInput = ({ spec, environmentId, revisionId, platform }) => {
+export const launchTemplateInput = ({
+  spec,
+  environmentId,
+  revisionId,
+  platform,
+  // The instance profile the workers assume. Defaults to the platform's shared
+  // executor profile; when the environment declares its own instanceRoleArn the
+  // ready-step resolves that role's profile and passes it here, so a per-environment
+  // grant (e.g. the C++ vcpkg S3 cache) rides only this environment's workers and
+  // never the shared default.
+  instanceProfileArn = platform.instanceProfileArn,
+}) => {
   const volume = spec.rootVolume ?? {};
   return {
     LaunchTemplateName:
@@ -234,7 +245,7 @@ export const launchTemplateInput = ({ spec, environmentId, revisionId, platform 
     ClientToken: `lt-${environmentId}-${revisionId}`,
     LaunchTemplateData: {
       ImageId: spec.imageId,
-      IamInstanceProfile: { Arn: platform.instanceProfileArn },
+      IamInstanceProfile: { Arn: instanceProfileArn },
       // IMDSv2 only. The worker reads its own instance id from IMDS to learn its
       // identity, so the endpoint must be enabled — but v1 must not be.
       MetadataOptions: {
@@ -302,8 +313,15 @@ export const createLaunchTemplateForRevision = async ({
   environmentId,
   revisionId,
   platform,
+  instanceProfileArn = platform.instanceProfileArn,
 }) => {
-  const input = launchTemplateInput({ spec, environmentId, revisionId, platform });
+  const input = launchTemplateInput({
+    spec,
+    environmentId,
+    revisionId,
+    platform,
+    instanceProfileArn,
+  });
   // 16 KB is the hard user-data limit, and a bootstrap that exceeds it fails at
   // launch rather than here — check while the error can still name the cause.
   const userDataBytes = Buffer.from(input.LaunchTemplateData.UserData, 'base64').length;

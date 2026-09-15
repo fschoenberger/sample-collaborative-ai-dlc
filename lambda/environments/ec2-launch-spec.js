@@ -65,6 +65,10 @@ const INSTANCE_FAMILY_PATTERN = /^[a-z][a-z0-9-]*$/;
 const ACCOUNT_PATTERN = /^\d{12}$/;
 const SECURITY_GROUP_PATTERN = /^sg-[0-9a-f]{8}([0-9a-f]{9})?$/;
 const POLICY_ARN_PATTERN = /^arn:[a-z0-9-]+:iam::(aws|\d{12}):policy\/.+$/;
+// A customer-account role ARN — never `aws`, since an instance role must live in
+// the deploying account for the platform to wrap it in an instance profile and to
+// simulate its policies at ready-time.
+const ROLE_ARN_PATTERN = /^arn:[a-z0-9-]+:iam::\d{12}:role\/.+$/;
 const AZ_PATTERN = /^[a-z]{2}(-[a-z]+)+-\d[a-z]$/;
 
 // Bounds. These are guardrails against a typo becoming a five-figure bill or an
@@ -421,6 +425,26 @@ export const validateEc2LaunchSpec = (input) => {
     label: 'IAM policy ARN',
   });
 
+  // The instance role this environment's workers run as. This is the PER-ENVIRONMENT
+  // IAM hook: an S3 vcpkg cache, ECR pull, a Secrets Manager read — anything a
+  // specific build class needs — belongs on THIS role, not smeared across the shared
+  // default profile where every other environment's workers would inherit it too.
+  //
+  // A role, not a policy list (the old additionalPolicyArns, which nothing ever
+  // attached): a role is the thing whose EFFECTIVE permissions can be simulated, so
+  // ready-time can prove it still grants the baseline a worker needs before the
+  // revision is allowed to publish (see assertRoleCoversWorkerBaseline). When unset
+  // the platform's default executor profile is used, exactly as before.
+  let instanceRoleArn = null;
+  if (input.instanceRoleArn != null && String(input.instanceRoleArn).trim() !== '') {
+    const raw = String(input.instanceRoleArn).trim();
+    if (!ROLE_ARN_PATTERN.test(raw)) {
+      errors.push(err('instanceRoleArn', 'must be an IAM role ARN in this account'));
+    } else {
+      instanceRoleArn = raw;
+    }
+  }
+
   const spec = {
     schemaVersion: EC2_LAUNCH_SPEC_SCHEMA_VERSION,
     platform,
@@ -451,6 +475,7 @@ export const validateEc2LaunchSpec = (input) => {
     associatePublicIp: false,
     securityGroupIds,
     additionalPolicyArns,
+    instanceRoleArn,
     workspacePath: String(input.workspacePath ?? EC2_LAUNCH_SPEC_DEFAULTS.workspacePath),
     parkPolicy: validateEnum(input.parkPolicy, {
       field: 'parkPolicy',

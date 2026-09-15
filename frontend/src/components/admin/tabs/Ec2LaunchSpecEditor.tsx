@@ -72,6 +72,7 @@ export interface Ec2FormState {
   strategyId: string;
   securityGroupIds: string;
   additionalPolicyArns: string;
+  instanceRoleArn: string;
   maxHourlyCostUsd: string;
   tags: string;
 }
@@ -109,6 +110,7 @@ export const emptyEc2Form = (): Ec2FormState => ({
   strategyId: EC2_LAUNCH_SPEC_DEFAULTS.strategyId,
   securityGroupIds: '',
   additionalPolicyArns: '',
+  instanceRoleArn: '',
   maxHourlyCostUsd: '',
   tags: '',
 });
@@ -198,6 +200,7 @@ export const launchSpecFromForm = (form: Ec2FormState): Ec2LaunchSpecInput => {
     rootVolume,
     securityGroupIds: parseList(form.securityGroupIds),
     additionalPolicyArns: parseList(form.additionalPolicyArns),
+    ...(form.instanceRoleArn.trim() ? { instanceRoleArn: form.instanceRoleArn.trim() } : {}),
     parkPolicy: form.parkPolicy,
     strategyId: form.strategyId,
     ...(parseInteger(form.maxInstances) === undefined
@@ -753,16 +756,16 @@ export function Ec2LaunchSpecEditor({
             placeholder="sg-0123456789abcdef0"
             onChange={(value) => set('securityGroupIds', value)}
           />
-          <ListField
-            id="ec2-policy-arns"
-            label="Additional IAM policies"
-            hint={`Optional, at most ${EC2_LIMITS.additionalPolicyArns.max}.`}
-            value={form.additionalPolicyArns}
-            field="additionalPolicyArns"
+          <TextField
+            id="ec2-instance-role"
+            label="Instance role ARN (optional)"
+            hint="This environment's workers run as this role. Must cover the worker baseline — validated at publish. Defaults to the shared executor role."
+            value={form.instanceRoleArn}
+            field="instanceRoleArn"
             errors={errors}
             disabled={disabled}
-            placeholder="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-            onChange={(value) => set('additionalPolicyArns', value)}
+            placeholder="arn:aws:iam::123456789012:role/my-cpp-worker"
+            onChange={(value) => set('instanceRoleArn', value)}
           />
           <div className="sm:col-span-2">
             <ListField
@@ -847,6 +850,12 @@ export function Ec2LaunchSpecSummary({ spec }: { spec: Ec2LaunchSpec }) {
           <div>
             <dt className="text-muted-foreground">Zones</dt>
             <dd className="font-mono">{spec.availabilityZones.join(', ')}</dd>
+          </div>
+        )}
+        {spec.instanceRoleArn && (
+          <div className="sm:col-span-2">
+            <dt className="text-muted-foreground">Instance role</dt>
+            <dd className="break-all font-mono">{spec.instanceRoleArn}</dd>
           </div>
         )}
         {spec.maxPricePerHour != null && (
