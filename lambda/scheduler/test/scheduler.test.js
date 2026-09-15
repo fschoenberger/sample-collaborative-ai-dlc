@@ -101,6 +101,34 @@ describe.skipIf(!host)('scheduler', () => {
       expect(delivered[0][1][0][1]).toEqual(['jobId', result.jobId]);
     });
 
+    it('folds runId AND placementKey into the provision generation', async () => {
+      // The halt-and-ask retry fix: two placements that share runId and attempt but
+      // differ in placementKey (the durable attempt/round identity) must hand the
+      // provisioner different generations, so CreateFleet does not replay the first
+      // launch's now-dead instance.
+      const environmentId = nextEnv();
+      const provisioners = stubProvisioners();
+      const scheduler = schedulerWith(provisioners);
+      const gen = () => provisioners.ec2Stub.provision.mock.calls.at(-1)[0].generation;
+
+      await scheduler.enqueueStage(
+        stageRequest(ec2Target(environmentId), { runId: 'run-A', placementKey: 'code-gen-u-x-round-1' }),
+      );
+      const first = gen();
+      await scheduler.enqueueStage(
+        stageRequest(ec2Target(environmentId), {
+          stageInstanceId: 's-1',
+          runId: 'run-A',
+          placementKey: 'code-gen-u-x-round-2',
+        }),
+      );
+      const second = gen();
+
+      expect(first).toContain('run-A');
+      expect(first).toContain('code-gen-u-x-round-1');
+      expect(second).not.toBe(first);
+    });
+
     it('registers the worker under its instance id, not the provisional id', async () => {
       // The runner learns its own instance id from IMDS, so that must be the
       // registry key or it cannot find its own addressed stream.

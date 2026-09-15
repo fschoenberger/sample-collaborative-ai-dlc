@@ -40,7 +40,12 @@ import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js'
 import { createRegistry } from '../shared/valkey/registry.js';
 import { getClient } from '../shared/valkey/client.js';
 import { strategyFor } from './strategies.js';
-import { MANAGED_TAG, createEc2Provisioner, provisionerFor } from './provisioners.js';
+import {
+  MANAGED_TAG,
+  createEc2Provisioner,
+  placementGeneration,
+  provisionerFor,
+} from './provisioners.js';
 
 const ec2 = new EC2Client({});
 const ssm = new SSMClient({});
@@ -126,6 +131,12 @@ export const createScheduler = ({
     // The orchestrator run this placement belongs to. Folded into the CreateFleet
     // client token so a retried step dedupes but a relaunch places afresh.
     runId = null,
+    // The durable attempt identity (orchestrator `attemptKey`). runId alone is NOT
+    // enough: a halt-and-ask retry re-drives the SAME run (same runId) with attempt
+    // still 1, so runId+workerId collide and CreateFleet replays the prior — now
+    // dead — instance for its 24h idempotency window. placementKey distinguishes
+    // those retry rounds while staying identical for a genuine step re-invocation.
+    placementKey = null,
     projectId = null,
     credentialBinding = null,
     payload = {},
@@ -216,7 +227,11 @@ export const createScheduler = ({
         workerId: provisionalWorkerId({ executionId, stageInstanceId, attempt }),
         executionId,
         subnetIds,
-        generation: runId,
+        // Generation = run id AND the durable attempt key. Either alone leaves a
+        // collision: runId is stable across a halt-and-ask retry, and attemptKey is
+        // stable across a rewind relaunch — together they change whenever the
+        // placement is genuinely new and stay put only for a true step re-run.
+        generation: placementGeneration({ runId, placementKey }),
       });
     } catch (error) {
       // LOG it. A provisioning failure used to be returned as a value and never

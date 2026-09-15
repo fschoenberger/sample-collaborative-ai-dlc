@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { clientTokenFor, createEc2Provisioner } from '../provisioners.js';
+import { clientTokenFor, createEc2Provisioner, placementGeneration } from '../provisioners.js';
 
 // The launch identity a stage placement carries. Only `generation` differs between
 // the two placements in the tests below — everything else is what a rewind retry of
@@ -43,6 +43,46 @@ describe('clientTokenFor', () => {
 
   it('still separates two different workers in the same run', () => {
     expect(clientTokenFor('p-a-si-1', 'run-A')).not.toBe(clientTokenFor('p-b-si-1', 'run-A'));
+  });
+});
+
+describe('placementGeneration', () => {
+  // The generation the scheduler actually feeds clientTokenFor: run id AND the
+  // durable attempt key. The bug this closes is the halt-and-ask RETRY — same run,
+  // attempt still 1 — which the run id alone cannot tell apart.
+  it('DIFFERS across halt-and-ask retry rounds within one run', () => {
+    // domain-theme's two retry rounds: identical runId and workerId, so only the
+    // attempt key (halt round) distinguishes them. Before this, both hashed to the
+    // same token and the second replayed the first's dead instance.
+    const g1 = placementGeneration({ runId: 'run-A', placementKey: 'code-generation-s1-u-domain-theme' });
+    const g2 = placementGeneration({
+      runId: 'run-A',
+      placementKey: 'code-generation-s1-u-domain-theme-round-2',
+    });
+    expect(g1).not.toBe(g2);
+    expect(clientTokenFor(WORKER_ID, g1)).not.toBe(clientTokenFor(WORKER_ID, g2));
+  });
+
+  it('DIFFERS across relaunches (new run id) for the same attempt key', () => {
+    const key = 'code-generation-s1-u-domain-theme';
+    const g1 = placementGeneration({ runId: 'run-A', placementKey: key });
+    const g2 = placementGeneration({ runId: 'run-B', placementKey: key });
+    expect(clientTokenFor(WORKER_ID, g1)).not.toBe(clientTokenFor(WORKER_ID, g2));
+  });
+
+  it('is STABLE for a genuine step re-invocation (same run id + attempt key)', () => {
+    // The dedupe the token must preserve: a durable step re-run with identical
+    // identity must not leave a second instance.
+    const args = { runId: 'run-A', placementKey: 'code-generation-s1-u-domain-theme' };
+    expect(placementGeneration(args)).toBe(placementGeneration(args));
+    expect(clientTokenFor(WORKER_ID, placementGeneration(args))).toBe(
+      clientTokenFor(WORKER_ID, placementGeneration(args)),
+    );
+  });
+
+  it('does not emit the literal "null" when parts are missing', () => {
+    expect(placementGeneration({})).not.toContain('null');
+    expect(placementGeneration()).toBe('~');
   });
 });
 

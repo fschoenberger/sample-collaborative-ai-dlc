@@ -1798,6 +1798,17 @@ const runStage = async (
           // and for `release`, where the instance is already gone.
           resumeWorkerId: heldWorkerId,
           runId,
+          // The placement key distinguishes CreateFleet client tokens across
+          // placements that share a runId and an attempt number but are genuinely
+          // different launches — most importantly a halt-and-ask RETRY, which
+          // re-drives the SAME durable run (so runId is unchanged) with attempt
+          // still 1. `attemptKey` already uniquely names this durable attempt
+          // (unit dimension + halt-round suffix + resume/feedback), so folding it
+          // into the token generation is what stops the second launch from
+          // replaying the first's now-terminated instance for 24h. It stays STABLE
+          // for a genuine step re-invocation (same attemptKey, same runId), so the
+          // dedupe the token exists for is preserved.
+          placementKey: attemptKey,
           payload: stagePayload(),
         })
       : invokeRuntime(stagePayload(), sessionId),

@@ -49,15 +49,37 @@ export const MANAGED_TAG = 'aidlc:scheduler';
  * nobody would ever complete, and the run hung until the 15-minute heartbeat.
  * Observed exactly that, twice over the same stage instance.
  *
- * The orchestrator run id is the right generation: the durable SDK re-invokes a
- * retried step with the same run id, so a genuine retry still dedupes, while every
- * relaunch (rewind, retry-from-failed) mints a new one and therefore places afresh.
+ * The generation is the orchestrator run id AND the durable attempt key, composed
+ * by `placementGeneration`. Neither is sufficient alone:
+ *   - The run id covers a RELAUNCH: rewind / retry-from-failed mints a new run, so
+ *     a fresh placement of the same stage gets a new token.
+ *   - But a halt-and-ask RETRY re-drives the SAME run (run id unchanged) with the
+ *     attempt number still 1, so run id + worker id collide. CreateFleet replayed
+ *     the first call's response — a `fleetInstanceSet` naming an instance already
+ *     terminated, `errorSet` empty, no error to notice — the scheduler wrote a
+ *     worker row for a dead instance, and the stage hung until the 15-minute
+ *     heartbeat. The attempt key (orchestrator `attemptKey`: unit dimension +
+ *     halt-round suffix + resume/feedback) is what distinguishes those rounds.
+ * Together they change whenever a placement is genuinely new and stay identical
+ * only for a true durable step re-invocation, which is exactly when dedupe is
+ * wanted. The whole generation is folded into the hash, so its length is free.
  */
 export const clientTokenFor = (workerId, generation) =>
   `worker-${createHash('sha256')
     .update(`${String(workerId)}|${String(generation ?? '')}`)
     .digest('hex')
     .slice(0, 40)}`;
+
+/**
+ * Compose the placement generation from the orchestrator run id and the durable
+ * attempt key. Kept beside clientTokenFor because it exists only to feed it, and
+ * the two must agree on how the parts are joined. Order and separator are fixed so
+ * the same (runId, placementKey) always yields the same string; a missing part is
+ * empty, never the literal "null", so an AgentCore-era caller that passes neither
+ * still hashes to a stable token.
+ */
+export const placementGeneration = ({ runId = null, placementKey = null } = {}) =>
+  `${runId ?? ''}~${placementKey ?? ''}`;
 
 const fleetTags = ({
   projectName,
