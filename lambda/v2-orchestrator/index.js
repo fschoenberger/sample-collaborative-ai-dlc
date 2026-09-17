@@ -986,19 +986,38 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // Credential resolution only permits active executions. Unpark META
         // before AgentCore restores a released session's workspace, otherwise
         // the re-clone is rejected while the execution still reads WAITING.
+        //
+        // Lane questions (unitSlug set) NEVER flip META to WAITING: one META
+        // pointer cannot represent concurrent lane gates, so process-bridge parks
+        // only the STAGE# row and leaves META RUNNING (see process-bridge.js
+        // `if (!unitSlug)`). A `fromStatus: 'WAITING'` CAS therefore ALWAYS misses
+        // for a lane gate and MUST NOT be read as retirement — the field incident
+        // was exactly this: the durable run resumed, the WAITING→RUNNING CAS
+        // failed, the run returned `retired` without a terminal META write, the
+        // intent stayed RUNNING, and the watchdog reaped it as
+        // `durable_execution_succeeded`. Assert ownership instead; only a genuine
+        // orchestratorRunId change is a real retirement.
+        const isLaneGate = Boolean(result?.unitSlug ?? gateAfter?.unitSlug);
         const ownedUnpark = await ctxArg.step(`gate-unpark-${humanTaskId}`, async () => {
           try {
             await store.updateExecution({
               executionId,
               status: 'RUNNING',
               pendingHumanTaskId: null,
-              fromStatus: 'WAITING',
+              // Non-lane (linear) gates DO set META WAITING at park, so keep the
+              // WAITING→RUNNING guard there; lane gates rely on ownership alone.
+              ...(isLaneGate ? {} : { fromStatus: 'WAITING' }),
               ifOrchestratorRunId: runId,
             });
             return true;
           } catch (e) {
-            if (e?.name === 'ConditionalCheckFailedException') return false;
-            throw e;
+            if (e?.name !== 'ConditionalCheckFailedException') throw e;
+            // The CAS can miss for two reasons: (1) we lost ownership (rewind/retry
+            // relaunched under a new runId) — a real retirement; or (2) a non-lane
+            // gate was already unparked to RUNNING by a duplicate resume. Re-read to
+            // disambiguate: if we still own the run, this is benign — proceed.
+            const current = await store.getExecution(executionId).catch(() => null);
+            return Boolean(current) && (current.orchestratorRunId ?? null) === runId;
           }
         });
         if (!ownedUnpark) {

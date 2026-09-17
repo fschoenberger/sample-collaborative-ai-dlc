@@ -809,20 +809,29 @@ describe('orchestrator durable handler', () => {
     expect(statuses).not.toContain('FAILED');
   });
 
-  it('exits retired when cancel or rewind wins the unpark CAS', async () => {
-    const cas = Object.assign(new Error('cas'), { name: 'ConditionalCheckFailedException' });
-    deps.store.updateExecution = vi.fn(async (input) => {
-      if (input.fromStatus === 'WAITING') throw cas;
-      return { orchestratorRunId: input.orchestratorRunId ?? null };
-    });
+  it('resumes a lane gate whose unpark needs no WAITING precondition', async () => {
+    // Field incident (chess): a LANE question (unitSlug set) never flips META to
+    // WAITING — one META pointer cannot represent concurrent lane gates, so
+    // process-bridge parks only the STAGE# row and leaves META RUNNING. The old
+    // `fromStatus: 'WAITING'` unpark CAS therefore always missed on resume, the
+    // run wrongly exited `retired` without a terminal write, the intent stranded
+    // RUNNING, and the watchdog reaped it as `durable_execution_succeeded`. A lane
+    // gate must unpark on ownership alone — no WAITING precondition.
     deps.store.getExecution
       .mockResolvedValueOnce(META)
-      .mockResolvedValue({ ...META, status: 'WAITING' });
+      .mockResolvedValue({ ...META, status: 'RUNNING' });
     deps.loadPlan.mockResolvedValue({ valid: true, plan: { stages: [{ stageId: 'a' }] } });
-    deps.store.getHumanTask = vi.fn(async () => ({ status: 'answered' }));
+    deps.store.getHumanTask = vi.fn(async () => ({ status: 'answered', unitSlug: 'identity' }));
     deps.invokeRuntime = makeRuntime(ctx, (payload, n) => {
       if (n === 1) return { ok: true };
-      if (n === 2) return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' };
+      if (n === 2)
+        return {
+          ok: true,
+          state: 'WAITING_FOR_HUMAN',
+          humanTaskId: 'h1',
+          unitSlug: 'identity',
+          sectionIndex: 1,
+        };
       return { ok: true, state: 'SUCCEEDED' };
     });
 
@@ -832,15 +841,16 @@ describe('orchestrator durable handler', () => {
       deps,
     );
 
-    expect(res).toMatchObject({ ok: false, reason: 'retired', humanTaskId: 'h1' });
-    expect(invokes.filter((p) => p.resumeFrom === 'h1')).toHaveLength(0);
-    expect(deps.store.updateExecution).toHaveBeenCalledWith(
-      expect.objectContaining({
-        status: 'RUNNING',
-        fromStatus: 'WAITING',
-        ifOrchestratorRunId: expect.stringMatching(/^run-/),
-      }),
-    );
+    // The run resumed (answer consumed) and completed instead of exiting retired.
+    expect(res.ok).toBe(true);
+    expect(invokes.filter((p) => p.resumeFrom === 'h1')).toHaveLength(1);
+    // The lane unpark asserted ownership WITHOUT a WAITING precondition.
+    const unpark = deps.store.updateExecution.mock.calls
+      .map((c) => c[0])
+      .find((a) => a.status === 'RUNNING' && a.pendingHumanTaskId === null);
+    expect(unpark).toBeTruthy();
+    expect(unpark.fromStatus).toBeUndefined();
+    expect(unpark.ifOrchestratorRunId).toMatch(/^run-/);
   });
 
   it('skips release when parkReleaseSeconds is null', async () => {
