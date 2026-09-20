@@ -13,7 +13,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- OpenCode stages failed immediately (`cli_nonzero_exit`) when the selected model was a Bedrock cross-region inference profile absent from OpenCode's embedded models.dev catalog — for example `global.moonshotai.kimi-k3`, which the pinned OpenCode build only knows as `moonshotai.kimi-k2.5`. OpenCode raised `ProviderModelNotFoundError` before ever calling Bedrock, surfaced only as an opaque `UnknownError`. The generated `OPENCODE_CONFIG_CONTENT` now registers the selected model under its provider (`provider.<provider>.models.<id>`), so any off-catalog Bedrock profile id resolves; known models are unaffected because OpenCode inherits provider defaults for every unset field.
 - Intents Lambda's outer error handler discarded the caught exception (`catch {}` bound nothing, and the log statement was a static `'intents handler error'` string), so every 500 arrived in CloudWatch as an identical opaque line and 500s on `/api/projects/*/intents/*` were undiagnosable in production. The catch now binds the error and logs its `message`, `name`, `code`, `stack`, plus API-Gateway request context (`resource`, `httpMethod`, `projectId`, `intentId`). The 500 response contract is unchanged.
 
 ## [2.0.0] - 2026-08-06

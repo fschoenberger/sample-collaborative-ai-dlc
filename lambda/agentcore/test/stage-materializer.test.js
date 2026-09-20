@@ -560,36 +560,6 @@ describe('OpenCode inline config', () => {
     expect(cfg.mcp.aidlc.command).toEqual(['node', '/real/mcp.js']);
   });
 
-  it('omits the provider block when no model is selected', () => {
-    const cfg = buildOpenCodeConfig({
-      mcpEntry: '/real/mcp.js',
-      scope: { executionId: 'e', intentId: 'i' },
-    });
-    expect(cfg.provider).toBeUndefined();
-  });
-
-  it('registers an off-catalog Bedrock model so OpenCode can resolve it', () => {
-    const cfg = buildOpenCodeConfig({
-      mcpEntry: '/real/mcp.js',
-      scope: { executionId: 'e', intentId: 'i' },
-      model: 'amazon-bedrock/global.moonshotai.kimi-k3',
-    });
-    expect(cfg.provider['amazon-bedrock'].models['global.moonshotai.kimi-k3']).toEqual({
-      name: 'global.moonshotai.kimi-k3',
-    });
-  });
-
-  it('defaults a bare model id to the Bedrock provider', () => {
-    const cfg = buildOpenCodeConfig({
-      mcpEntry: '/real/mcp.js',
-      scope: { executionId: 'e', intentId: 'i' },
-      model: 'global.moonshotai.kimi-k3',
-    });
-    expect(cfg.provider['amazon-bedrock'].models['global.moonshotai.kimi-k3']).toEqual({
-      name: 'global.moonshotai.kimi-k3',
-    });
-  });
-
   it('materializes only the selected CLI context and never writes .opencode', async () => {
     const ws = await mkdtemp(path.join(tmpdir(), 'aidlc-opencode-'));
     const context = await materializeCliContext({
