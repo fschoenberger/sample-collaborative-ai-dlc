@@ -233,6 +233,15 @@ export const launchTemplateInput = ({
   // grant (e.g. the C++ vcpkg S3 cache) rides only this environment's workers and
   // never the shared default.
   instanceProfileArn = platform.instanceProfileArn,
+  // The AMI's actual root device name, resolved from DescribeImages by the
+  // ready-step. A block-device mapping only OVERRIDES the root volume (size,
+  // type, encryption) when its DeviceName equals the AMI's RootDeviceName; a
+  // mismatch makes EC2 treat the mapping as an ADDITIONAL disk, so the root
+  // comes up at the AMI snapshot's default size and the configured volume is
+  // attached unformatted, unmounted, and unused. The Fedora worker AMIs root on
+  // `/dev/sda1`, not the old `/dev/xvda` default — so this must be the AMI's own
+  // value, not a guess.
+  rootDeviceName = null,
 }) => {
   const volume = spec.rootVolume ?? {};
   return {
@@ -263,7 +272,7 @@ export const launchTemplateInput = ({
       SecurityGroupIds: [platform.securityGroupId, ...(spec.securityGroupIds ?? [])],
       BlockDeviceMappings: [
         {
-          DeviceName: platform.rootDeviceName ?? '/dev/xvda',
+          DeviceName: rootDeviceName ?? platform.rootDeviceName ?? '/dev/xvda',
           Ebs: {
             VolumeSize: volume.sizeGiB ?? 100,
             VolumeType: volume.type ?? 'gp3',
@@ -314,6 +323,7 @@ export const createLaunchTemplateForRevision = async ({
   revisionId,
   platform,
   instanceProfileArn = platform.instanceProfileArn,
+  rootDeviceName = null,
 }) => {
   const input = launchTemplateInput({
     spec,
@@ -321,6 +331,7 @@ export const createLaunchTemplateForRevision = async ({
     revisionId,
     platform,
     instanceProfileArn,
+    rootDeviceName,
   });
   // 16 KB is the hard user-data limit, and a bootstrap that exceeds it fails at
   // launch rather than here — check while the error can still name the cause.

@@ -311,7 +311,8 @@ const readyEc2Revision = async ({ store, environment, revision, spec, deps }) =>
       }),
     )
     .catch(() => ({ Images: [] }));
-  const verdict = evaluateImage(spec, described.Images?.[0] ?? null);
+  const describedImage = described.Images?.[0] ?? null;
+  const verdict = evaluateImage(spec, describedImage);
   if (!verdict.valid) {
     return store.updateRevision(environment.environmentId, revision.revisionId, {
       status: 'FAILED',
@@ -363,6 +364,11 @@ const readyEc2Revision = async ({ store, environment, revision, spec, deps }) =>
     revisionId: revision.revisionId,
     platform,
     instanceProfileArn,
+    // Use the AMI's real root device so the configured root volume size/type
+    // actually overrides root (Fedora roots on /dev/sda1, not /dev/xvda). Without
+    // this the worker booted on the tiny snapshot-size root and the configured
+    // volume was attached as an unmounted orphan. See launchTemplateInput.
+    rootDeviceName: describedImage?.RootDeviceName ?? null,
   });
   return store.updateRevision(environment.environmentId, revision.revisionId, {
     status: 'READY',
