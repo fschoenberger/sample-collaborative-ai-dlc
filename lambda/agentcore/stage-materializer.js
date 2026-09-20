@@ -409,24 +409,56 @@ export const toOpenCodeMcp = (mcpServers = {}) => {
 
 export const OPENCODE_INSTRUCTIONS = ['.aidlc/rules.md', '.aidlc/opencode-instructions/*.md'];
 
+// Split a selected opencode model into { providerId, modelId }, mirroring the
+// opencode driver's `--model` normalization: a value with a slash is a full
+// `provider/id` and is used verbatim; a bare id defaults to the Bedrock
+// provider. Returns null for an empty/unusable value.
+const openCodeProviderModel = (model) => {
+  if (!model) return null;
+  const value = String(model);
+  const resolved = value.includes('/') ? value : `amazon-bedrock/${value}`;
+  const slash = resolved.indexOf('/');
+  const providerId = resolved.slice(0, slash);
+  const modelId = resolved.slice(slash + 1);
+  if (!providerId || !modelId) return null;
+  return { providerId, modelId };
+};
+
 export const buildOpenCodeConfig = ({
   mcpEntry,
   scope,
   env = {},
   customServers = {},
   instructions = OPENCODE_INSTRUCTIONS,
+  model = null,
 }) => {
   // buildMcpConfig writes the reserved server last. Preserve that insertion
   // order through conversion so repository/user config cannot replace `aidlc`
   // when this inline config is merged after project configuration.
   const common = buildMcpConfig({ mcpEntry, scope, env, customServers }).mcpServers;
   const { aidlc, ...others } = toOpenCodeMcp(common);
-  return {
+  const config = {
     $schema: 'https://opencode.ai/config.json',
     share: 'disabled',
     instructions,
     mcp: { ...others, aidlc },
   };
+  // OpenCode resolves `--model` against its embedded models.dev catalog and
+  // throws ProviderModelNotFoundError for any id it does not ship — and that
+  // snapshot lags new Bedrock cross-region inference profiles (e.g.
+  // `global.moonshotai.kimi-k3`, which the pinned build only knows as
+  // `moonshotai.kimi-k2.5`). Registering the selected model under its provider
+  // makes the id resolvable without waiting for a catalog release; opencode
+  // inherits the provider's defaults for every field we leave unset, so a known
+  // model is unaffected and an off-catalog one simply becomes usable.
+  const providerModel = openCodeProviderModel(model);
+  if (providerModel) {
+    const { providerId, modelId } = providerModel;
+    config.provider = {
+      [providerId]: { models: { [modelId]: { name: modelId } } },
+    };
+  }
+  return config;
 };
 
 // OpenCode reads inline config after repository configuration. Returning the
@@ -437,7 +469,8 @@ export const materializeOpenCodeConfig = async ({
   scope,
   env = process.env,
   customServers = {},
-}) => JSON.stringify(buildOpenCodeConfig({ mcpEntry, scope, env, customServers }));
+  model = null,
+}) => JSON.stringify(buildOpenCodeConfig({ mcpEntry, scope, env, customServers, model }));
 
 // ── Codex config (per-stage CODEX_HOME) ──
 //

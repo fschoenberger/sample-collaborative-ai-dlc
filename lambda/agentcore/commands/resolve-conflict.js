@@ -252,6 +252,7 @@ export const resolveConflict = async (
         mcpEntry,
         scope,
         env,
+        model,
       });
       invocation = driver.buildInvocation({ prompt, model, opencodeConfigContent });
     } else if (cli === 'codex') {

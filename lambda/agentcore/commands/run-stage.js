@@ -451,6 +451,7 @@ const runReviewer = async ({
               mcpEntry,
               scope,
               env,
+              model,
             }),
           }
         : cli === 'codex'
@@ -1756,6 +1757,7 @@ export const runStage = async (
         scope: stageScope,
         env,
         customServers,
+        model,
       });
       return { opencodeConfigContent };
     }
