@@ -113,6 +113,17 @@ RUN cd /opt/agentcore \
 COPY --chown=node:node agentcore/ /opt/agentcore/
 COPY --chown=node:node shared/ /opt/shared/
 
+# OpenCode resolves `--model` against its embedded models.dev catalog and rejects
+# any id it does not ship (ProviderModelNotFoundError). That snapshot lags new
+# Bedrock cross-region inference profiles (e.g. `global.moonshotai.kimi-k3`, only
+# known to the pinned build as `moonshotai.kimi-k2.5`). This user-level config
+# registers such ids under the amazon-bedrock provider; it merges UNDER the
+# per-stage OPENCODE_CONFIG_CONTENT the runtime generates (which sets no
+# `provider` block), so the ids resolve without waiting for a catalog release.
+RUN install -d -o node -g node -m 0755 /home/node/.config/opencode
+COPY --chown=node:node --chmod=0644 \
+    agentcore/opencode-bedrock-models.json /home/node/.config/opencode/opencode.json
+
 # The shared/ helpers are CommonJS loaded from /opt/shared, so Node resolves their
 # @aws-sdk deps upward from /opt/shared — never into /opt/agentcore/node_modules
 # where they are installed. Symlink so the shared helpers see the same deps.

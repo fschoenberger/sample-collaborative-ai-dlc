@@ -246,6 +246,19 @@ ln -sf /opt/opencode/bin/opencode /usr/local/bin/opencode
 rm -f /tmp/opencode.tar.gz
 opencode --version | grep -qF "${OPENCODE_VERSION}"
 
+# OpenCode rejects any --model id absent from its embedded models.dev catalog
+# (ProviderModelNotFoundError), and that snapshot lags new Bedrock cross-region
+# inference profiles (e.g. global.moonshotai.kimi-k3). Register such ids as a
+# user-level config so they resolve; it merges UNDER the per-stage
+# OPENCODE_CONFIG_CONTENT the runner generates (which sets no `provider` block).
+# The aidlc-runner service runs with HOME=/root (see its unit below), so opencode
+# reads /root/.config/opencode/. Single source of truth with the AgentCore image
+# (lambda/agentcore/Dockerfile bakes the same file); the flutter AMI inherits it
+# by layering on this base image.
+install -d -m 0755 /root/.config/opencode
+install -m 0644 "${REPO}/lambda/agentcore/opencode-bedrock-models.json" \
+  /root/.config/opencode/opencode.json
+
 # Bun, for the deterministic CODE sensors (they shell out to bunx eslint / tsc).
 curl -fsSL https://bun.sh/install | BUN_INSTALL=/opt/bun bash
 ln -sf /opt/bun/bin/bun /usr/local/bin/bun

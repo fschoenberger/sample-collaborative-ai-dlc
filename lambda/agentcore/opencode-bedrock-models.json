@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "amazon-bedrock": {
+      "models": {
+        "global.moonshotai.kimi-k3": {
+          "name": "Kimi K3",
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "attachment": true
+        }
+      }
+    }
+  }
+}
