@@ -2,9 +2,12 @@ const ALLOWED_CLI_MODEL_KEYS = new Set(['kiro', 'claude', 'opencode', 'codex']);
 const MAX_CLI_MODEL_LENGTH = 200;
 const OPENCODE_MODEL_PREFIX = 'amazon-bedrock/';
 const CODEX_MODEL_PREFIX = 'openai.';
-// A full Codex-on-Bedrock id: the prefix plus a non-empty model name (bare
-// "openai." would pass a prefix check but fail at invocation time).
-const CODEX_MODEL_ID = /^openai\.[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// A full Codex-on-Bedrock id: an OPTIONAL cross-region geo prefix
+// (us./eu./apac./global.) — required by cross-region-only profiles like
+// "global.openai.gpt-5.6-sol" — followed by the "openai." prefix and a
+// non-empty model name (bare "openai." would pass a prefix check but fail at
+// invocation time).
+const CODEX_MODEL_ID = /^(?:(?:us|eu|apac|global)\.)?openai\.[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function describe(value) {
   if (value === null) return 'null';
@@ -78,12 +81,15 @@ function normalizeCliModels(value) {
       continue;
     }
     // Codex on Bedrock uses its own namespace of exact "openai.*" ids (e.g.
-    // "openai.gpt-5.5") — no geo prefix, no "amazon-bedrock/" provider prefix,
-    // and a bare "openai." (empty model name) is rejected too.
+    // "openai.gpt-5.5"), optionally with a cross-region geo prefix
+    // ("us."/"eu."/"apac."/"global.") for cross-region inference profiles that
+    // have no in-Region variant (e.g. "global.openai.gpt-5.6-sol"). The
+    // "amazon-bedrock/" provider prefix is invalid, and a bare "openai."
+    // (empty model name) is rejected too.
     if (key === 'codex' && trimmed && !CODEX_MODEL_ID.test(trimmed)) {
       issues.push({
         path: key,
-        message: `Codex model must be a full Bedrock OpenAI model ID starting with "${CODEX_MODEL_PREFIX}" (e.g. "openai.gpt-5.5").`,
+        message: `Codex model must be a full Bedrock OpenAI model ID starting with "${CODEX_MODEL_PREFIX}" (optionally with a "us."/"eu."/"apac."/"global." cross-region geo prefix, e.g. "openai.gpt-5.5" or "global.openai.gpt-5.6-sol").`,
       });
       continue;
     }

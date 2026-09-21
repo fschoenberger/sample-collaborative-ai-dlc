@@ -242,6 +242,73 @@ describe('runStage — happy path', () => {
   });
 });
 
+describe('runStage — remote reconcile on stage entry (buildhost stale-checkout fix)', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  // A stage that operates on the intent integration branch with a warm checkout
+  // (source NOT re-cloned this run).
+  const withRepos = { ...baseArgs, repos: ['o/r'], branch: 'ai-dlc/i1', baseBranch: 'main' };
+
+  it('fetches + hard-resets the branch to the remote head before the CLI runs', async () => {
+    let seen = null;
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      ensureWorkspaceSource: async () => ({ restored: false }),
+      redirectHeavyDirs: async () => ({ links: [] }),
+      refreshIntentWorkspace: async (opts) => {
+        seen = opts;
+        return { ok: true, results: [{ repo: 'o/r', refreshed: true }] };
+      },
+    });
+    const res = await runStage(withRepos, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    // Reconciled the CURRENT stage branch against its own remote head.
+    expect(seen).toMatchObject({ intentBranch: 'ai-dlc/i1', repos: ['o/r'] });
+    const reconciled = deps.store.calls.find(
+      (c) => c[0] === 'appendEvent' && c[1].type === 'v2.workspace.reconciled',
+    );
+    expect(reconciled).toBeTruthy();
+  });
+
+  it('is a non-fatal no-op when the branch has no remote ref yet', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      ensureWorkspaceSource: async () => ({ restored: false }),
+      redirectHeavyDirs: async () => ({ links: [] }),
+      refreshIntentWorkspace: async () => ({
+        ok: false,
+        reason: 'refresh_failed',
+        results: [{ repo: 'o/r', refreshed: false, reason: 'fetch_failed' }],
+      }),
+    });
+    const res = await runStage(withRepos, deps);
+    // Stage still succeeds — the deterministic push path re-fetches/rebases.
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    const skipped = deps.store.calls.find(
+      (c) => c[0] === 'appendEvent' && c[1].type === 'v2.workspace.reconcile_skipped',
+    );
+    expect(skipped).toBeTruthy();
+  });
+
+  it('skips the reconcile when the source was just re-cloned (already current)', async () => {
+    let called = false;
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      ensureWorkspaceSource: async () => ({ restored: true, repos: ['o/r'] }),
+      redirectHeavyDirs: async () => ({ links: [] }),
+      refreshIntentWorkspace: async () => {
+        called = true;
+        return { ok: true, results: [] };
+      },
+    });
+    const res = await runStage(withRepos, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(called).toBe(false);
+  });
+});
+
 describe('runStage — knowledge injection (both tiers reach the prompt)', () => {
   // Capture the `knowledge` string run-stage composes and hands to the materializer.
   const captureKnowledge = () => {

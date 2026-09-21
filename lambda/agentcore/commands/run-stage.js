@@ -77,6 +77,7 @@ import {
   redirectHeavyDirs as defaultRedirectHeavyDirs,
 } from '../workspace.js';
 import { commitAndPushAll as defaultCommitAndPushAll, freeDiskBytes } from '../git-engine.js';
+import { refreshIntentWorkspace as defaultRefreshIntentWorkspace } from './lane.js';
 import { resolveStageModel } from '../model-resolver.js';
 import { createGraphWriter, closeGraphSource } from '../mcp/graph-writer.js';
 import { createSensorRunner } from '../sensor-runner.js';
@@ -1036,6 +1037,11 @@ export const runStage = async (
     // Engine-owned git (docs/v2-parallel.md WP2): commit + push after every CLI
     // exit. Injected for tests.
     commitAndPushAll = defaultCommitAndPushAll,
+    // Reconcile the warm per-intent checkout with the remote on stage entry: the
+    // build stages push out-of-band from a separate EC2 buildhost, so a surviving
+    // checkout can be behind the branch head. Reuses the lane command's fetch +
+    // hard-reset-to-remote. Injected for tests.
+    refreshIntentWorkspace = defaultRefreshIntentWorkspace,
     compileContextPack = defaultCompileContextPack,
     // Fetch project custom agent rules (.md bodies) from S3 → written into the
     // selected CLI's native rules dir by the materializer. Injected for tests.
@@ -1322,6 +1328,65 @@ export const runStage = async (
         action: 'agent.workspace',
         payload: { state: 'RESTORED', repos: heal.repos },
       });
+    }
+  }
+
+  // 2a½. Reconcile the warm checkout with the remote (docs/v2-parallel.md WP2:
+  // "the git remote is the source of truth; the local checkout is a cache").
+  // The AgentCore Runtime reuses ONE per-intent checkout across stages, but the
+  // build stages (workspace-scaffold / code-generation / build-and-test) run on
+  // a SEPARATE EC2 buildhost that pushes its commits straight to the remote. So
+  // a checkout that survives from an earlier AgentCore stage can be BEHIND the
+  // branch head — this stage would then commit on a stale base and its exit push
+  // would be rejected non-fast-forward ("fetch first"), and a retry against the
+  // same stale checkout would fail identically. Fetch origin and hard-reset the
+  // branch to `refs/remotes/origin/<branch>` before any work begins (reusing the
+  // lane command's fetch + `checkout -B` reset). Skipped when the source was just
+  // re-cloned (a fresh clone is already at the remote head) and for repo-less
+  // projects. NON-FATAL by design: a brand-new branch has no remote ref yet
+  // (nothing to reconcile) and a transient fetch miss must never fail the stage —
+  // the deterministic push path's own fetch/rebase (git-engine) is the backstop.
+  if (repos.length > 0 && branch && !sourceRestored) {
+    const reconciled = await refreshIntentWorkspace(
+      {
+        projectId,
+        executionId,
+        repos,
+        intentBranch: branch,
+        baseBranch,
+        baseBranches,
+        gitProvider,
+        repoProviders,
+        workspaceDir,
+      },
+      { ensureWorkspaceSource },
+    ).catch((error) => ({ ok: false, reason: 'reconcile_crashed', detail: error?.message }));
+    const refreshed = (reconciled?.results ?? []).filter((r) => r.refreshed);
+    if (refreshed.length > 0) {
+      await emitLifecycleEvent({
+        type: 'v2.workspace.reconciled',
+        summary: `Working tree reset to remote ${branch} before stage entry (${refreshed
+          .map((r) => r.repo)
+          .join(', ')})`,
+        stageInstanceId,
+        action: 'agent.workspace',
+        payload: { state: 'RECONCILED', branch, repos: refreshed.map((r) => r.repo) },
+      });
+    } else if (!reconciled?.ok) {
+      // Benign: no remote ref yet (first push on this branch) or a transient
+      // fetch miss. Record it for operators, then proceed on the current
+      // checkout — the push path re-fetches and rebases before it pushes.
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.workspace.reconcile_skipped',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: 'agentcore',
+          summary: `Remote reconcile of ${branch} was a no-op (${reconciled?.reason ?? 'unknown'}) — proceeding on the current checkout`,
+        })
+        .catch(() => {});
     }
   }
 

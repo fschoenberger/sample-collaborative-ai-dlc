@@ -419,13 +419,22 @@ export const freeDiskBytes = async ({ dir, statfsFn = statfs }) => {
   }
 };
 
-// Is there anything HEAD has that the remote-tracking ref does not? Used to
-// skip the push (and its network/auth cost) when the tree is clean and the
-// last push already landed. A missing remote-tracking ref (new branch, never
-// pushed) counts as ahead. No HEAD at all (empty repo) is NOT ahead.
-export const isAheadOfRemote = async ({ dir, branch, git = runGit }) => {
+// Is there anything HEAD has that the remote does NOT? Used to skip the push
+// (and its network/auth cost) when the tree is clean and the last push already
+// landed. A missing remote-tracking ref (new branch, never pushed) counts as
+// ahead. No HEAD at all (empty repo) is NOT ahead.
+//
+// The comparison MUST be against the ACTUAL remote head, not a remote-tracking
+// ref left stale by an out-of-band push (the EC2 buildhost commits to the same
+// branch between AgentCore stages). When a `fetch` capability is supplied the
+// tracking ref is refreshed first so the decision reflects the live remote;
+// callers without credentials fall back to the last-known tracking ref. The
+// fetch is best-effort — a transient failure degrades to the stale ref rather
+// than throwing.
+export const isAheadOfRemote = async ({ dir, branch, git = runGit, fetch = null }) => {
   const head = await git(['rev-parse', 'HEAD'], { cwd: dir });
   if (head.exitCode !== 0) return false;
+  if (fetch) await fetch().catch(() => {});
   const remoteRef = await git(['rev-parse', '--verify', `refs/remotes/origin/${branch}`], {
     cwd: dir,
   });
@@ -476,12 +485,68 @@ export const pushBranch = async ({
       async (env) => {
         let lastDetail = '';
         for (let attempt = 1; attempt <= attempts; attempt++) {
-          // Push HEAD explicitly to the remote refspec so it works even if the
-          // local branch name diverged (v1 semantics).
-          const push = await git(['push', 'origin', `HEAD:refs/heads/${branch}`], {
+          // Reconcile with the remote BEFORE pushing (defense-in-depth against a
+          // non-fast-forward rejection): the remote may have advanced out-of-band
+          // — the EC2 buildhost pushes to the same intent branch between AgentCore
+          // stages — leaving this checkout behind. Fetch the current remote head
+          // and REPLAY our local commits on top of it, so a legitimately advanced
+          // remote is incorporated rather than clobbered. A brand-new branch (no
+          // remote ref yet) has nothing to reconcile and pushes as a plain
+          // fast-forward. The retry re-runs this fetch/rebase rather than
+          // repeating the identical rejected push.
+          await git(['fetch', 'origin', branch], { cwd: dir, env }).catch(() => {});
+          const remoteRef = await git(['rev-parse', '--verify', `refs/remotes/origin/${branch}`], {
             cwd: dir,
-            env,
           });
+          const remoteSha = remoteRef.exitCode === 0 ? remoteRef.stdout.trim() : null;
+          // Only reconcile when the histories have actually DIVERGED — i.e. the
+          // remote head is NOT already an ancestor of HEAD. When it IS an ancestor
+          // (a brand-new branch, or a checkout that merely sits ahead — the common
+          // case, including engine-built --no-ff merge commits) the push is a plain
+          // fast-forward and we must NOT rewrite HEAD: rebasing would flatten a
+          // merge commit and re-author its parents.
+          let diverged = false;
+          if (remoteSha) {
+            const isAncestor = await git(['merge-base', '--is-ancestor', remoteSha, 'HEAD'], {
+              cwd: dir,
+              env,
+            });
+            diverged = isAncestor.exitCode !== 0;
+          }
+          if (diverged) {
+            // Replay our local commits on top of the advanced remote head so its
+            // out-of-band work (the buildhost) is incorporated. Engine committer
+            // identity for the rewritten commits (the shared runner has no ambient
+            // git identity); the original author is preserved by rebase.
+            const rebase = await git([...gitIdentity(), 'rebase', remoteSha], { cwd: dir, env });
+            if (rebase.exitCode !== 0) {
+              // Truly divergent history we cannot auto-replay (a real content
+              // conflict): abort the half-applied rebase and let the push below
+              // surface the rejection as a value for the caller to act on.
+              await git(['rebase', '--abort'], { cwd: dir, env }).catch(() => {});
+              log(`rebase onto origin/${branch} conflicted for ${repo}; pushing as-is`);
+            }
+          }
+          // The rebase (when it ran) rewrote our commits onto the remote head —
+          // re-read HEAD so the push and its verification use the new local tip.
+          const headNow = await git(['rev-parse', 'HEAD'], { cwd: dir });
+          const pushSha = headNow.exitCode === 0 ? headNow.stdout.trim() : localHead;
+          // Push HEAD explicitly to the remote refspec so it works even if the
+          // local branch name diverged (v1 semantics). After a divergence rebase
+          // the push is non-fast-forward, so use --force-with-lease (NEVER plain
+          // --force): the lease is checked against the sha we just fetched, so a
+          // remote that advanced AGAIN since our fetch is safely rejected (and
+          // re-reconciled on the next attempt) instead of being clobbered. The
+          // fast-forward path pushes normally.
+          const pushArgs = diverged
+            ? [
+                'push',
+                `--force-with-lease=refs/heads/${branch}:${remoteSha}`,
+                'origin',
+                `HEAD:refs/heads/${branch}`,
+              ]
+            : ['push', 'origin', `HEAD:refs/heads/${branch}`];
+          const push = await git(pushArgs, { cwd: dir, env });
           if (push.exitCode === 0) {
             // Remote-HEAD verification. A mismatch can be a legitimate race (the
             // remote advanced); an unreadable ls-remote falls back to trusting the
@@ -489,17 +554,17 @@ export const pushBranch = async ({
             const remote = await git(['ls-remote', 'origin', branch], { cwd: dir, env });
             if (remote.exitCode === 0) {
               const remoteHead = remote.stdout.trim().split(/\s/)[0] ?? '';
-              const verified = remoteHead === localHead;
+              const verified = remoteHead === pushSha;
               if (!verified) {
                 log(`push verification mismatch for ${repo}#${branch}:`, {
-                  localHead,
+                  localHead: pushSha,
                   remoteHead,
                 });
               }
-              return { pushed: true, sha: localHead, verified };
+              return { pushed: true, sha: pushSha, verified };
             }
             log(`ls-remote failed for ${repo}#${branch}; trusting push exit code`);
-            return { pushed: true, sha: localHead, verified: false };
+            return { pushed: true, sha: pushSha, verified: false };
           }
           lastDetail = (push.stderr || '').trim().slice(-500);
           log(`push attempt ${attempt}/${attempts} failed for ${repo}#${branch}`);
@@ -1170,9 +1235,25 @@ export const commitAndPushAll = async ({
         continue;
       }
       // Skip the network when there is provably nothing to push: no new
-      // commit AND the remote-tracking ref matches HEAD. A clean tree with an
-      // ahead HEAD still pushes — it retries a previously failed push.
-      if (!commit.committed && !(await isAheadOfRemote({ dir, branch, git }))) {
+      // commit AND the FRESH remote head matches HEAD. The freshness fetch means
+      // an out-of-band advance of the remote (the buildhost) is never mistaken
+      // for "up to date" off a stale tracking ref. A clean tree that is ahead
+      // still pushes — it retries a previously failed push.
+      const refreshRemote = () =>
+        fetchOrigin({
+          dir,
+          repo: url,
+          gitProvider: provider,
+          projectId,
+          executionId,
+          urls,
+          git,
+          withGitCredential,
+        });
+      if (
+        !commit.committed &&
+        !(await isAheadOfRemote({ dir, branch, git, fetch: refreshRemote }))
+      ) {
         results.push({ repo: url, ...commit, pushed: 'up_to_date' });
         continue;
       }

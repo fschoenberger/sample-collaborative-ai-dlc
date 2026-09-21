@@ -530,6 +530,27 @@ describe('isAheadOfRemote', () => {
     await git(['init', empty], root);
     expect(await isAheadOfRemote({ dir: empty, branch: 'main' })).toBe(false);
   });
+
+  // The freshness fetch (defense-in-depth): when the remote advanced out-of-band
+  // the STALE tracking ref would wrongly report "up to date" (equal to HEAD). A
+  // supplied fetch refreshes the tracking ref first, so the difference is seen.
+  it('sees an out-of-band remote advance when a fetch capability is supplied', async () => {
+    const { work, remote } = await initRemoteAndClone();
+    const urls = { auth: remote, clean: 'https://github.com/o/r.git' };
+
+    // Advance main from another clone; our tracking ref stays stale == HEAD.
+    const other = path.join(root, 'other');
+    await git(['clone', remote, other], root);
+    await writeFile(path.join(other, 'x.js'), 'x\n');
+    await commitAll({ dir: other, message: 'aidlc(x): e1' });
+    await pushBranch({ dir: other, repo: 'o/r', branch: 'main', urls });
+
+    // Stale tracking ref: HEAD equals the last-known remote → "not ahead".
+    expect(await isAheadOfRemote({ dir: work, branch: 'main' })).toBe(false);
+    // With a fetch, the refreshed remote head differs from HEAD → reported.
+    const fetch = () => fetchOrigin({ dir: work, repo: 'o/r', urls });
+    expect(await isAheadOfRemote({ dir: work, branch: 'main', fetch })).toBe(true);
+  });
 });
 
 describe('remoteBranchExists', () => {
@@ -658,6 +679,57 @@ describe('pushBranch', () => {
   it('refuses without a branch', async () => {
     const res = await pushBranch({ dir: root, repo: 'o/r', branch: null });
     expect(res).toEqual({ pushed: false, reason: 'no_branch' });
+  });
+
+  // Defense-in-depth for the buildhost stale-checkout bug: the remote branch
+  // advanced out-of-band while this checkout held its own new commit. A plain
+  // push would be rejected non-fast-forward; pushBranch must fetch, rebase our
+  // commit onto the advanced remote head, and land BOTH commits via
+  // --force-with-lease.
+  it('rebases onto an out-of-band advanced remote and preserves both commits', async () => {
+    const { work, remote } = await initRemoteAndClone();
+    const urls = { auth: remote, clean: 'https://github.com/o/r.git' };
+
+    // Out-of-band advance: a second clone pushes a commit to main behind our back.
+    const other = path.join(root, 'other');
+    await git(['clone', remote, other], root);
+    await writeFile(path.join(other, 'buildhost.js'), 'from ec2\n');
+    await commitAll({ dir: other, message: 'aidlc(build-and-test): e1' });
+    await pushBranch({ dir: other, repo: 'o/r', branch: 'main', urls });
+
+    // Our checkout is now behind AND carries its own committed work → diverged.
+    await writeFile(path.join(work, 'agent.js'), 'from agentcore\n');
+    const local = await commitAll({ dir: work, message: 'aidlc(ci-pipeline): e1' });
+
+    const res = await pushBranch({ dir: work, repo: 'o/r', branch: 'main', urls });
+    expect(res.pushed).toBe(true);
+    // HEAD was rewritten by the rebase onto the remote head — the reported sha is
+    // the NEW tip, not the original local commit.
+    expect(res.sha).not.toBe(local.sha);
+    expect(res.verified).toBe(true);
+
+    // Both the buildhost's file and our file are present on the pushed history.
+    const files = await git(['ls-tree', '-r', '--name-only', 'HEAD'], work);
+    expect(files.stdout).toContain('buildhost.js');
+    expect(files.stdout).toContain('agent.js');
+    const subjects = await git(['log', '--format=%s', 'refs/remotes/origin/main'], work);
+    expect(subjects.stdout).toContain('aidlc(build-and-test): e1');
+    expect(subjects.stdout).toContain('aidlc(ci-pipeline): e1');
+  });
+
+  // A checkout that is merely AHEAD (remote head is an ancestor of HEAD) must be
+  // a plain fast-forward: no rebase, no force, the local commit sha is preserved.
+  it('fast-forwards without rewriting when the checkout is only ahead', async () => {
+    const { work, remote } = await initRemoteAndClone();
+    await writeFile(path.join(work, 'ahead.js'), 'ahead\n');
+    const local = await commitAll({ dir: work, message: 'aidlc(x): e1' });
+    const res = await pushBranch({
+      dir: work,
+      repo: 'o/r',
+      branch: 'main',
+      urls: { auth: remote, clean: 'https://github.com/o/r.git' },
+    });
+    expect(res).toEqual({ pushed: true, sha: local.sha, verified: true });
   });
 });
 

@@ -82,6 +82,21 @@ describe('normalizeCliModels', () => {
     });
   });
 
+  it('accepts an openai.* id with an optional cross-region geo prefix for Codex', () => {
+    // GPT-5.6 Sol/Terra/Luna are cross-region-only inference profiles: they
+    // REQUIRE a geo prefix (no in-Region variant exists).
+    for (const good of [
+      'openai.gpt-5.6-sol',
+      'global.openai.gpt-5.6-terra',
+      'us.openai.gpt-5.6-luna',
+    ]) {
+      const result = normalizeCliModels({ codex: good });
+      expect(result.valid).toBe(true);
+      expect(result.issues).toEqual([]);
+      expect(result.value).toEqual({ codex: good });
+    }
+  });
+
   it('rejects Codex model values outside the openai.* namespace', () => {
     for (const bad of ['us.anthropic.claude-sonnet-4-6', 'amazon-bedrock/openai.gpt-5.5']) {
       const result = normalizeCliModels({ codex: bad });
